@@ -21,7 +21,7 @@ from PIL import Image, ImageQt, ImageOps
 import rawpy
 
 from PySide6.QtCore import Qt, QSize, QRect, QRectF, QPoint, QTimer, QObject, Signal, Slot, QEvent, QElapsedTimer, QStandardPaths
-from PySide6.QtGui import QPixmap, QKeySequence, QAction, QPainter, QPen, QColor, QFontDatabase, QFont, QIcon, QImage
+from PySide6.QtGui import QPixmap, QKeySequence, QAction, QPainter, QPen, QColor, QFontDatabase, QFont, QIcon, QImage, QPolygon, QPainterPath, QBrush
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QMessageBox, QFrame,
     QStatusBar, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStackedWidget,
@@ -50,6 +50,90 @@ def _ptime(label: str, warn_ms: float = 16.0):
 SUPPORTED_EXTS = {
     '.cr3', '.cr2', '.nef', '.arw', '.raf', '.dng', '.orf', '.rw2', '.srw', '.pef'
 }
+
+_XMP_GLOBAL_LOCK = threading.Lock()
+def read_xmp_sidecar(path: str) -> Dict:
+    """Reads rating, label, and pick status from an XMP sidecar file."""
+    if exiv2 is None: return {}
+    xmp_path = os.path.splitext(path)[0] + '.xmp'
+
+    with _XMP_GLOBAL_LOCK:
+        try:
+            if not os.path.exists(xmp_path) or os.path.getsize(xmp_path) == 0:
+                return {}
+        except FileNotFoundError:
+            return {} # File might have been deleted between os.path.exists and os.path.getsize
+
+        # If file exists and is not empty, try to read it with retries for robustness.
+        for attempt in range(3):
+            try:
+                img = exiv2.ImageFactory.open(xmp_path)
+                img.readMetadata()
+                xmp = img.xmpData()
+                
+                data = {}
+                if 'Xmp.xmp.Rating' in xmp:
+                    data['rating'] = int(xmp['Xmp.xmp.Rating'].print())
+                if 'Xmp.xmp.Label' in xmp:
+                    data['color_label'] = xmp['Xmp.xmp.Label'].print()
+                if 'Xmp.photoshop.Urgency' in xmp:
+                    urgency_val = int(xmp['Xmp.photoshop.Urgency'].print())
+                    data['selected'] = urgency_val == 1
+                return data
+            except exiv2.Exiv2Error as e:
+                if e.code == 21 and attempt < 2: # kerInputDataReadFailed
+                    time.sleep(0.05)
+                    continue
+                print(f"Warning: Could not read XMP for {os.path.basename(path)}: {e}")
+                return {}
+            except Exception as e:
+                print(f"Warning: Unexpected error reading XMP for {os.path.basename(path)}: {e}")
+                return {}
+        return {}
+
+def write_xmp_sidecar(path: str, data: Dict):
+    """Writes rating, label, or pick status to an XMP sidecar file."""
+    if exiv2 is None: return
+    xmp_path = os.path.splitext(path)[0] + '.xmp'
+    
+    with _XMP_GLOBAL_LOCK:
+        try:
+            raw_img = exiv2.ImageFactory.open(path)
+            raw_img.readMetadata()
+            
+            if os.path.exists(xmp_path):
+                try:
+                    sidecar_img = exiv2.ImageFactory.open(xmp_path)
+                    sidecar_img.readMetadata()
+                    raw_img.setXmpData(sidecar_img.xmpData())
+                except Exception:
+                    pass
+
+            xmp = raw_img.xmpData()
+
+            if 'rating' in data and data['rating'] is not None:
+                rating_val = int(data['rating'])
+                if rating_val == 0 and 'Xmp.xmp.Rating' in xmp:
+                     xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Rating')))
+                elif rating_val > 0:
+                    xmp['Xmp.xmp.Rating'] = str(rating_val)
+            
+            if 'color_label' in data:
+                label_val = data['color_label']
+                if label_val:
+                    xmp['Xmp.xmp.Label'] = str(label_val)
+                elif 'Xmp.xmp.Label' in xmp:
+                    xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Label')))
+
+            if 'selected' in data and data['selected'] is not None:
+                xmp['Xmp.photoshop.Urgency'] = str(1 if data['selected'] else 0)
+
+            with open(xmp_path, 'w', encoding='utf-8') as f:
+                f.write(raw_img.xmpPacket())
+
+        except Exception as e:
+            print(f"Error writing XMP for {os.path.basename(path)}: {e}")
+
 
 def read_exif_datetime(path: str) -> Optional[datetime]:
     ext = os.path.splitext(path)[1].lower()
@@ -237,11 +321,12 @@ def _exiv2_read_meta_text(path: str) -> Dict[str, str]:
     if exiv2 is None:
         return {}
     try:
-        try:
-            if hasattr(exiv2, "enableBMFF"):
-                exiv2.enableBMFF()
-        except Exception:
-            pass
+        # The enableBMFF call is often deprecated and not needed.
+        # try:
+        #     if hasattr(exiv2, "enableBMFF"):
+        #         exiv2.enableBMFF()
+        # except Exception:
+        #     pass
         img = exiv2.ImageFactory.open(path)
         img.readMetadata()
         exif = img.exifData()
@@ -321,6 +406,32 @@ class Photo:
     timestamp: datetime
     filesize: int
     selected: bool = False
+    rating: int = 0
+    color_label: str = ""
+    
+    # --- MODIFIED ---
+    xmp_loaded: bool = False  # XMP 파일을 읽었는지 여부
+    is_dirty: bool = False    # 메모리 상태가 파일과 다른지 여부
+    is_saving: bool = False   # 파일에 저장하는 작업이 진행 중인지 여부
+
+    def update_xmp(self, data: Dict):
+        """메모리 상태를 변경하고 dirty 플래그를 설정합니다."""
+        changed = False
+        if 'rating' in data and self.rating != data['rating']:
+            self.rating = data['rating']
+            changed = True
+        if 'color_label' in data and self.color_label != data['color_label']:
+            self.color_label = data['color_label']
+            changed = True
+        if 'selected' in data and self.selected != data['selected']:
+            self.selected = data['selected']
+            changed = True
+        
+        if changed:
+            self.is_dirty = True
+            # 사용자가 다시 수정했으므로, 진행 중이던 저장 작업은 의미가 없어집니다.
+            # is_saving 상태를 초기화하여 새로운 변경사항이 덮어써지는 것을 방지합니다.
+            self.is_saving = False
 
 class Catalog:
     def __init__(self, root: str):
@@ -350,6 +461,7 @@ class Catalog:
             items.append((dt, p, sz))
         items.sort(key=lambda x: x[0])
         self.photos = [Photo(path=p, timestamp=dt, filesize=sz) for dt, p, sz in items]
+
     def total_photos(self) -> int:
         return len(self.photos)
 
@@ -852,6 +964,14 @@ class ImageView(QLabel):
         super().mouseReleaseEvent(e)
                    
 class Filmstrip(QWidget):
+    COLOR_LABEL_MAP = {
+        "Red":    QColor("#fa4a45"),
+        "Yellow": QColor("#fbeb1c"),
+        "Green":  QColor("#46cf4e"),
+        "Blue":   QColor("#0085ff"),
+        "Purple": QColor("#ad5bff"),
+    }
+  
     def __init__(self, loader, on_click, height=120, parent=None):
         super().__init__(parent)
         self.loader = loader
@@ -873,17 +993,16 @@ class Filmstrip(QWidget):
             return
         margin = 8
         h = self.height() - margin*2
+        # 모든 썸네일 컨테이너를 3:2 비율로 고정
+        w = int(h * 1.5)
 
         thumbs: List[Optional[QPixmap]] = []
-        widths: List[int] = []
         for it in self.items:
             pm = self.loader(it['path'], h)
             thumbs.append(pm)
-            if pm is None or pm.height() == 0:
-                widths.append(h)
-            else:
-                ratio = h / pm.height()
-                widths.append(int(pm.width() * ratio))
+
+        # 모든 너비를 계산된 3:2 너비로 설정
+        widths = [w] * len(self.items)
 
         cur_idx = next((i for i, it in enumerate(self.items) if it.get('current')), 0)
         cur_w = widths[cur_idx]
@@ -913,15 +1032,132 @@ class Filmstrip(QWidget):
             x_right = r.right() + 1 + margin
 
     def _draw_thumb(self, p: QPainter, r: QRect, pm: Optional[QPixmap], it: Dict):
-        if pm is not None:
-            p.drawPixmap(r, pm, QRect(0,0, pm.width(), pm.height()))
-        else:
-            p.fillRect(r, QColor(40,40,40))
-        if it.get('selected'):
-            pen = QPen(QColor("#4CEF50")); pen.setWidth(3); p.setPen(pen); p.drawRect(r.adjusted(1,1,-1,-1))
-        if it.get('current'):
-            pen = QPen(QColor("#f0f0f0")); pen.setWidth(4); p.setPen(pen); p.drawRect(r)
+        # 3:2 비율의 컨테이너를 배경보다 약간 밝은 회색(#222222)으로 채웁니다.
+        p.fillRect(r, QColor("#222222"))
 
+        if pm is not None and not pm.isNull():
+            # 이미지의 원래 비율을 유지하면서 3:2 컨테이너 안에 맞도록 크기를 계산합니다.
+            scaled_size = pm.size().scaled(r.size(), Qt.KeepAspectRatio)
+            
+            # 컨테이너(r)의 중앙에 이미지를 위치시킬 좌표를 계산합니다.
+            x = r.x() + (r.width() - scaled_size.width()) / 2
+            y = r.y() + (r.height() - scaled_size.height()) / 2
+            target_rect = QRect(int(x), int(y), scaled_size.width(), scaled_size.height())
+            
+            # 계산된 위치에 이미지를 그립니다.
+            p.drawPixmap(target_rect, pm, pm.rect())
+        
+        # 오버레이(별점, 색상 라벨, 선택 테두리 등)는 전체 3:2 컨테이너를 기준으로 그립니다.
+        self._draw_rating(p, r, it.get('rating', 0))
+        
+        labelBorderColor = QColor("#1e1e1e")
+        selectedBorderWidth = 2
+        currentLineWidth = 6
+        
+        if it.get('current'):
+            pen = QPen(QColor("#aaaaaa")); pen.setWidth(currentLineWidth); p.setPen(pen); p.drawRect(r.adjusted(-3,-3,3,3))
+            labelBorderColor = QColor("#aaaaaa")
+        
+        if it.get('selected'):
+            pen = QPen(QColor("#4ffd65")); pen.setWidth(selectedBorderWidth); p.setPen(pen); p.drawRect(r)
+            labelBorderColor = QColor("#4ffd65")
+            
+        self._draw_color_label(p, r, it.get('color_label', ''),labelBorderColor,selectedBorderWidth)
+        
+    def _draw_color_label(self, p: QPainter, r: QRect, label: str, borderColor: QColor, borderWidth: int):
+        if not label or label not in self.COLOR_LABEL_MAP:
+            return
+        color = self.COLOR_LABEL_MAP[label]
+        
+        # 1. size를 썸네일 높이의 1/3로 설정 (정수 나눗셈 // 사용)
+        size = r.height() // 3 
+
+        # Define the three points for the top-left corner triangle
+        p1 = QPoint(r.left(), r.top())
+        p2 = QPoint(r.left() + size, r.top())
+        p3 = QPoint(r.left(), r.top() + size)
+        triangle = QPolygon([p1, p2, p3])
+
+        # Save painter state to not affect other drawings
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing) # For a smooth diagonal edge
+        
+        # 2. 삼각형 내부 채우기 (외곽선 없이)
+        p.setBrush(color)
+        p.setPen(Qt.NoPen) # No outline for the filled triangle
+        p.drawPolygon(triangle)
+
+        # 3. 대각선 경계선 그리기
+        # 검은색 펜 설정 (두께를 조절하고 싶으면 QPen(Qt.black, 2) 처럼 사용 가능)
+        p.setPen(QPen(borderColor,borderWidth)) 
+        # p2에서 p3까지 선 그리기 (이것이 대각선입니다)
+        p.drawLine(p2, p3)
+        
+        p.restore()
+
+    def _draw_rating(self, p: QPainter, r: QRect, rating: int):
+        if rating <= 0:
+            return
+
+        star_str_full = "★" * rating + "☆" * (5 - rating)
+        available_width = r.width() - 4  # Small horizontal margin
+
+        # --- Dynamic Font Sizing Logic ---
+        font = p.font()
+        font_size = 12  # Start with a default size
+        while font_size > 6:  # Minimum practical font size
+            font.setPointSize(font_size)
+            p.setFont(font)
+            fm = p.fontMetrics()
+            text_width = fm.horizontalAdvance(star_str_full)
+            if text_width <= available_width:
+                break  # This font size fits, so we use it
+            font_size -= 1
+        # --- End of Dynamic Sizing ---
+
+        # The painter's font is now set to the optimal size
+        fm = p.fontMetrics()
+        
+        # Draw filled stars
+        filled_str = "★" * rating
+        filled_width = fm.horizontalAdvance(filled_str)
+        
+        # Draw empty stars
+        empty_str = "☆" * (5 - rating)
+        
+        total_width = fm.horizontalAdvance(filled_str + empty_str)
+        
+        # Calculate the starting X position to center the entire string
+        start_x = r.left() + (r.width() - total_width) // 2
+        # Vertically align text to the bottom of the thumbnail
+        text_rect = QRect(start_x, r.bottom() - fm.height() - 2, total_width, fm.height())
+
+        # --- 수정된 부분: 검은색 테두리가 있는 노란색 별 그리기 ---
+        if filled_str:
+            # 1. 채워진 별에 대한 QPainterPath 생성
+            path = QPainterPath()
+            # 폰트 메트릭스를 사용하여 텍스트의 기준선을 정렬합니다.
+            path.addText(text_rect.left(), text_rect.top() + fm.ascent(), font, filled_str)
+
+            # 2. 검은색 테두리 그리기 (stroke)
+            # 테두리 두께(이 예제에서는 1)는 필요에 따라 조절할 수 있습니다.
+            pen = QPen(QColor("black"), 1)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush) # 내부는 채우지 않음
+            p.drawPath(path)
+
+            # 3. 금색으로 내부 채우기 (fill)
+            brush = QBrush(QColor("#FFD700"))
+            p.setBrush(brush)
+            p.setPen(Qt.NoPen) # 채울 때는 테두리를 그리지 않음
+            p.drawPath(path)
+            p.setBrush(Qt.NoBrush)
+        # --- 수정 종료 ---
+
+        # 기존과 동일: 회색 별 그리기
+        empty_rect = QRect(text_rect.left() + filled_width, text_rect.top(), text_rect.width() - filled_width, text_rect.height())
+        p.setPen(QColor("#808080"))
+        p.drawText(empty_rect, Qt.AlignLeft | Qt.AlignVCenter, empty_str)
     def mousePressEvent(self, e):
         pos = e.position().toPoint()
         for r, path in self.rects:
@@ -933,6 +1169,7 @@ class Filmstrip(QWidget):
 class LoaderSignals(QObject):
     loaded = Signal(str, str)
     meta = Signal(str, dict)
+    xmp = Signal(str, dict)
     thumb_ready = Signal(str, int, object)
     resized_pixmap_ready = Signal(str, QSize, object)
 
@@ -1013,6 +1250,7 @@ class CullingWidget(QWidget):
         self.signals = LoaderSignals()
         self.signals.loaded.connect(self._on_loaded)
         self.signals.meta.connect(self._on_meta_ready)
+        self.signals.xmp.connect(self._on_xmp_ready)
         self.signals.thumb_ready.connect(self._on_thumb_ready)
         self.signals.resized_pixmap_ready.connect(self._on_resized_pixmap_ready)
 
@@ -1030,18 +1268,20 @@ class CullingWidget(QWidget):
         self._full_running = 0
 
         self.selections_path = os.path.join(root, 'selections.json')
-        self._dirty = False
-        self._load_selections()
+        self._load_selections() # Kept for legacy compatibility, but XMP is now primary
 
         self.autosave_timer = QTimer(self); self.autosave_timer.setSingleShot(True)
-        self.autosave_timer.timeout.connect(self.save_selections)
         self.autosave_interval_timer = QTimer(self)
         self.update_autosave_interval()
-        self.autosave_interval_timer.timeout.connect(self.save_selections)
+        # --- MODIFIED ---
+        self.autosave_timer.timeout.connect(self.save_all_dirty_files)
+        self.autosave_interval_timer.timeout.connect(self.save_all_dirty_files)
         self.autosave_interval_timer.start()
 
         self._pending_tasks = set()
         self._pending_lock = threading.Lock()
+
+        self._load_all_xmp_data()
 
         self._schedule_timer = QTimer(self); self._schedule_timer.setSingleShot(True)
         self._schedule_timer.setInterval(80); self._schedule_timer.timeout.connect(self._schedule_loading_plan_fire)
@@ -1073,6 +1313,11 @@ class CullingWidget(QWidget):
 
         if not self.catalog.photos:
             QMessageBox.information(self, "Information", "No supported photo files found.")
+        elif exiv2 is None:
+            QMessageBox.warning(self, "XMP 기능 비활성화",
+                                "py3exiv2 라이브러리를 찾을 수 없습니다.\n"
+                                "등급 및 색상 라벨 기능이 비활성화됩니다.\n"
+                                "`pip install py3exiv2`를 실행하여 설치해주세요.")
 
         self.setStyleSheet("""
             QWidget#card {
@@ -1131,7 +1376,7 @@ class CullingWidget(QWidget):
     def _create_actions(self):
         self.actions: Dict[str, QAction] = {}
         action_map = {
-            'save': self.save_selections,
+            'save': self.save_all_dirty_files, # MODIFIED
             'quit': self.window().close,
             'next': self.next_photo,
             'prev': self.prev_photo,
@@ -1162,6 +1407,27 @@ class CullingWidget(QWidget):
                 self.toggle_zebra(); return True
             if self._hdr_toggle_key is not None and key == self._hdr_toggle_key:
                 self.toggle_hdr(); return True
+            
+            # Handle XMP shortcuts
+            if Qt.Key_1 <= key <= Qt.Key_5:
+                self.set_rating(key - Qt.Key_0)
+                return True
+            if key == Qt.Key_6:
+                self.set_color_label("Red")
+                return True
+            if key == Qt.Key_7:
+                self.set_color_label("Yellow")
+                return True
+            if key == Qt.Key_8:
+                self.set_color_label("Green")
+                return True
+            if key == Qt.Key_9:
+                self.set_color_label("Blue")
+                return True
+            if key == Qt.Key_0:
+                self.set_color_label("Purple")
+                return True
+
         return super().eventFilter(obj, ev)
 
     def _note_user_input(self):
@@ -1242,6 +1508,8 @@ class CullingWidget(QWidget):
         key = (path, kind); self._enqueue(priority, key, self._worker_entry, path, kind)
     def _enqueue_meta(self, path: str):
         key = (path, 'meta'); self._enqueue(-89, key, self._worker_entry, path, 'meta')
+    def _enqueue_xmp(self, path: str, priority: int):
+        key = (path, 'xmp'); self._enqueue(priority, key, self._worker_entry, path, 'xmp')
     def _enqueue_thumb(self, path: str, target_h: int, priority: int):
         key = (path, 'thumb', target_h); self._enqueue(priority, key, self._worker_build_thumb, path, target_h)
     def _enqueue_extract_thumb(self, path: str, target_h: int, priority: int):
@@ -1269,6 +1537,11 @@ class CullingWidget(QWidget):
             pil = self._get_pil_full_cached(path) or self._get_pil_half_cached(path)
             if pil and 'size' not in m: m['size'] = f"{pil.size[0]}x{pil.size[1]}"
             self.signals.meta.emit(path, m)
+        elif kind == 'xmp':
+            with _ptime(f"worker xmp {os.path.basename(path)}", warn_ms=10):
+                xmp_data = read_xmp_sidecar(path)
+            if xmp_data:
+                self.signals.xmp.emit(path, xmp_data)
 
     def _acquire_full_slot(self):
         while not self._loader_stop:
@@ -1382,13 +1655,20 @@ class CullingWidget(QWidget):
 
     def show_help(self):
         hotkeys = self.settings.hotkeys
+        xmp_hotkeys = (
+            "<b>XMP/Rating:</b>\n"
+            "  1-5: Set star rating\n"
+            "  6: Red, 7: Yellow, 8: Green, 9: Blue\n"
+            "  0: Clear color label"
+        )
         QMessageBox.information(self, "Key Bindings",
             f"Navigate: {hotkeys.get('next','')} (Next), {hotkeys.get('prev','')} (Previous)\n"
             f"Mouse: Wheel to zoom, Drag to pan (when zoomed)\n"
             f"Select: {hotkeys.get('toggle_select','')} (Toggle), {hotkeys.get('unselect','')} (Unselect)\n"
             f"View Modes: {hotkeys.get('toggle_zebra','')} (Toggle Zebra/Histogram), {hotkeys.get('toggle_hdr','')} (Toggle Faux HDR Preview)\n"
             f"Save/Export: {hotkeys.get('save','')} (Save selections.json), {hotkeys.get('export','')} (Export)\n"
-            f"Exit: {hotkeys.get('quit','')}"
+            f"Exit: {hotkeys.get('quit','')}\n\n"
+            f"{xmp_hotkeys}"
         )
 
     def _current(self) -> Optional[Photo]:
@@ -1403,21 +1683,68 @@ class CullingWidget(QWidget):
         if self.idx > 0:
             self.idx -= 1; self._show_current(); self._heavy_load_scheduler.start()
 
+    # --- NEW ---
+    def _load_xmp_if_needed(self, photo: Photo):
+        """Photo 객체의 XMP 데이터를 아직 읽지 않았다면 파일에서 읽기 작업을 예약합니다."""
+        if photo.xmp_loaded:
+            return
+        
+        # xmp_loaded 플래그를 즉시 True로 설정하여 중복 요청 방지
+        photo.xmp_loaded = True
+        # 백그라운드에서 XMP 읽기 요청
+        self._enqueue_xmp(photo.path, priority=-95)
+
+    # --- MODIFIED ---
     def toggle_select(self):
         p = self._current()
         if not p: return
-        p.selected = not p.selected
+        
+        self._load_xmp_if_needed(p) # XMP가 로드되었는지 확인
+        p.update_xmp({'selected': not p.selected}) # 메모리 상태만 변경
+        
         self._update_selected_badge_fast()
-        self._mark_dirty_and_autosave()
-        self._show_current()
+        self._show_current() # UI 갱신
+        self.autosave_timer.start(1500) # 짧은 시간 후 자동 저장 트리거
 
+    # --- MODIFIED ---
     def unselect_current(self):
         p = self._current()
         if not p: return
-        p.selected = False
-        self._update_selected_badge_fast()
-        self._mark_dirty_and_autosave()
-        self._show_current()
+        if p.selected:
+            self._load_xmp_if_needed(p)
+            p.update_xmp({'selected': False})
+            
+            self._update_selected_badge_fast()
+            self._show_current()
+            self.autosave_timer.start(1500)
+
+    # --- MODIFIED ---
+    def set_rating(self, rating: int):
+        p = self._current()
+        if not p or not (0 <= rating <= 5): return
+        
+        self._load_xmp_if_needed(p)
+        
+        new_rating = 0 if p.rating == rating else rating
+        p.update_xmp({'rating': new_rating})
+        
+        self._show_temporary_status(f"Rating set to {p.rating} star(s)", 1000)
+        self._update_filmstrip()
+        self.autosave_timer.start(1500)
+
+    # --- MODIFIED ---
+    def set_color_label(self, label: Optional[str]):
+        p = self._current()
+        if not p: return
+        
+        self._load_xmp_if_needed(p)
+        
+        new_label = "" if p.color_label == label else (label or "")
+        p.update_xmp({'color_label': new_label})
+        
+        self._show_temporary_status(f"Color label set to {p.color_label or 'None'}", 1000)
+        self._update_filmstrip()
+        self.autosave_timer.start(1500)
 
     def toggle_zebra(self):
         self.zebra_toggled = not self.zebra_toggled
@@ -1425,7 +1752,7 @@ class CullingWidget(QWidget):
         self.badge_zebra.setText("Zebra ON" if self.zebra_toggled else "Zebra OFF")
         self.badge_zebra.setObjectName("badge" if self.zebra_toggled else "badgeGhost")
         self.badge_zebra.style().unpolish(self.badge_zebra); self.badge_zebra.style().polish(self.badge_zebra)
-        self._show_temporary_status(f"Zebra/Histogram: {'ON' if self.zebra_toggled else 'OFF'}")
+        self._show_temporary_status(f"Zebra/Histogram: {'ON' if self.zebra_toggled else 'OFF'}", 1000)
 
     def toggle_hdr(self):
         self.hdr_toggled = not self.hdr_toggled
@@ -1433,18 +1760,16 @@ class CullingWidget(QWidget):
         self.badge_hdr.setText("Faux HDR ON" if self.hdr_toggled else "Faux HDR OFF")
         self.badge_hdr.setObjectName("badge" if self.hdr_toggled else "badgeGhost")
         self.badge_hdr.style().unpolish(self.badge_hdr); self.badge_hdr.style().polish(self.badge_hdr)
-        self._show_temporary_status(f"Faux HDR Preview: {'ON' if self.hdr_toggled else 'OFF'}")
+        self._show_temporary_status(f"Faux HDR Preview: {'ON' if self.hdr_toggled else 'OFF'}", 1000)
 
     def _show_temporary_status(self, message: str, timeout: int = 1000):
         self.status_restore_timer.stop()
         self.status_message.emit(message, 0)
         self.status_restore_timer.start(timeout)
 
-    def _mark_dirty_and_autosave(self):
-        self._dirty = True; self.autosave_timer.start(1500)
-
+    # --- MODIFIED ---
     def export_selected(self):
-        self.save_selections()
+        self.save_all_dirty_files() # 내보내기 전 모든 변경사항을 파일에 저장
         self.export_requested.emit()
 
     def _on_filmstrip_click(self, path: str):
@@ -1466,16 +1791,22 @@ class CullingWidget(QWidget):
         return None
 
 
-    def _update_filmstrip(self, k_forward: int = 5, k_backward: int = 2):
+    def _update_filmstrip(self, k_forward: int = 5, k_backward: int = 5):
         if not self.catalog.photos: self.filmstrip.set_items([]); return
         items = []
         start_back = max(0, self.idx - k_backward)
         for i in range(start_back, self.idx):
-            ph = self.catalog.photos[i]; items.append({'path': ph.path, 'selected': ph.selected, 'current': False})
-        phc = self.catalog.photos[self.idx]; items.append({'path': phc.path, 'selected': phc.selected, 'current': True})
+            ph = self.catalog.photos[i]
+            items.append({'path': ph.path, 'selected': ph.selected, 'current': False, 'rating': ph.rating, 'color_label': ph.color_label})
+        
+        phc = self.catalog.photos[self.idx]
+        items.append({'path': phc.path, 'selected': phc.selected, 'current': True, 'rating': phc.rating, 'color_label': phc.color_label})
+        
         end_forward = min(len(self.catalog.photos), self.idx + 1 + k_forward)
         for i in range(self.idx + 1, end_forward):
-            ph = self.catalog.photos[i]; items.append({'path': ph.path, 'selected': ph.selected, 'current': False})
+            ph = self.catalog.photos[i]
+            items.append({'path': ph.path, 'selected': ph.selected, 'current': False, 'rating': ph.rating, 'color_label': ph.color_label})
+        
         self.filmstrip.set_items(items)
 
         target_h = max(32, self.filmstrip.height() - 0)
@@ -1499,7 +1830,50 @@ class CullingWidget(QWidget):
         cur = self._current()
         if cur and cur.path == path:
             self._update_metadata(path)
+    
+    @Slot(str, dict)
+    def _on_xmp_ready(self, path: str, data: Dict):
+        photo = next((p for p in self.catalog.photos if p.path == path), None)
+        if not photo:
+            return
 
+        # --- MODIFIED ---
+        # 핵심 로직 강화:
+        # 사용자가 데이터를 수정했거나(is_dirty), 
+        # 혹은 파일에 저장하는 작업이 진행 중일 때(is_saving)는
+        # 파일에서 읽어온 낡은 데이터로 절대 덮어쓰지 않습니다.
+        if photo.is_dirty or photo.is_saving:
+            return
+
+        # 사용자가 수정하지 않은 경우에만 파일에서 읽어온 데이터로 메모리를 업데이트합니다.
+        has_changed = False
+        new_rating = data.get('rating', 0)
+        if photo.rating != new_rating:
+            photo.rating = new_rating
+            has_changed = True
+
+        new_label = data.get('color_label', '')
+        if photo.color_label != new_label:
+            photo.color_label = new_label
+            has_changed = True
+
+        new_selected = data.get('selected', photo.selected)
+        if photo.selected != new_selected:
+            photo.selected = new_selected
+            has_changed = True
+
+        if has_changed:
+            cur = self._current()
+            # UI 업데이트는 현재 보고 있는 사진일 경우에만 수행
+            if cur and cur.path == path:
+                self.view.set_selected(photo.selected)
+                self._update_filmstrip()
+            else:
+                # 현재 화면이 아닌 경우 필름 스트립만 업데이트해도 충분
+                self.filmstrip.update()
+            
+            self._update_selected_badge_fast()
+        
     def _refresh_statusbar(self):
         if self.status_restore_timer.isActive(): return
         p = self._current()
@@ -1510,11 +1884,14 @@ class CullingWidget(QWidget):
         msg = f"[{self.idx+1}/{total}]  Selected: {total_sel}  {os.path.basename(p.path)}  |  workers: {self._num_workers}"
         self.status_message.emit(msg, 0)
 
+    # --- MODIFIED ---
     def _show_current(self):
         p = self._current()
         if not p:
             self.meta_left.setText("")
             self.view.setText("No images"); return
+
+        self._load_xmp_if_needed(p) # --- ADDED ---
 
         self.view.set_selected(p.selected)
         self._update_metadata(p.path)
@@ -1620,6 +1997,8 @@ class CullingWidget(QWidget):
 
         if self._get_pil_half_cached(cur_path) is None:
             self._enqueue_load(cur_path, 'half', -100)
+        
+        self._enqueue_xmp(cur_path, -95)
 
         self._start_full_delay_timer(cur_path)
 
@@ -1634,6 +2013,7 @@ class CullingWidget(QWidget):
 
         HALF_BASE = -60
         for pth, d in neighbors:
+            self._enqueue_xmp(pth, HALF_BASE + d * 2)
             if self._get_pil_half_cached(pth) is not None:
                 self._enqueue_build_resized_pixmap(pth, target_size, HALF_BASE + d * 2 + 1)
             else:
@@ -1667,33 +2047,71 @@ class CullingWidget(QWidget):
         if self._get_pil_full_cached(cur.path) is None:
             self._enqueue_load(cur.path, 'full', -90)
 
+    def _load_all_xmp_data(self):
+        """Enqueue loading of XMP data for all photos at startup."""
+        for i, photo in enumerate(self.catalog.photos):
+            self._enqueue_xmp(photo.path, priority=100 + i)
+
     def _load_selections(self):
         try:
             with open(self.selections_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             selected_set = set(data.get('selected_paths', []))
             for p in self.catalog.photos:
+                # XMP 'selected' status will override this later if it exists
                 p.selected = (p.path in selected_set)
         except Exception:
             pass
 
-    def save_selections(self):
-        if not getattr(self, '_dirty', False) and not self.autosave_timer.isActive():
-             pass
-        elif not getattr(self, '_dirty', False):
-            return
+    # --- NEW (replaces save_selections and _mark_dirty_and_autosave) ---
+    def save_all_dirty_files(self):
+        """메모리에서 변경된 모든 사항(selections.json 및 XMP)을 파일에 저장합니다."""
+        self.autosave_timer.stop()
+
+        # 1. selections.json 저장은 기존과 동일
         selected_paths = [p.path for p in self.catalog.photos if p.selected]
         data = {'root': self.catalog.root, 'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'selected_paths': selected_paths}
         try:
             with open(self.selections_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self._dirty = False
-            self._show_temporary_status(f"Saved selections.json ({len(selected_paths)} files)", 2000)
         except Exception as e:
-            self._show_temporary_status(f"Error saving selections: {e}", 2000)
+            print(f"Error saving selections.json: {e}")
 
+        # 2. 변경된 XMP 파일들 저장 로직 수정
+        dirty_photos = [p for p in self.catalog.photos if p.is_dirty]
+        if not dirty_photos:
+            return
+
+        for photo in dirty_photos:
+            data_to_write = {
+                'rating': photo.rating,
+                'color_label': photo.color_label,
+                'selected': photo.selected
+            }
+
+            # --- NEW ---
+            # 백그라운드 작업 완료 후 Photo 객체의 상태를 업데이트할 함수를 정의합니다.
+            # 이 함수는 백그라운드 스레드에서 직접 Photo 객체를 수정합니다.
+            # (단순 플래그 변경이라 스레드 충돌 위험이 거의 없어 안전합니다.)
+            def _write_task_with_cleanup(path, data, photo_obj):
+                try:
+                    write_xmp_sidecar(path, data)
+                finally:
+                    # 파일 쓰기가 성공하든 실패하든, '저장 중' 상태는 해제합니다.
+                    photo_obj.is_saving = False
+
+            # 백그라운드 워커에게 쓰기 작업과 정리 작업을 포함한 래퍼 함수를 전달합니다.
+            self._post_task(20, _write_task_with_cleanup, photo.path, data_to_write, photo)
+            
+            # Photo의 상태를 'dirty'에서 'saving'으로 전환합니다.
+            photo.is_dirty = False
+            photo.is_saving = True
+
+        self._show_temporary_status(f"Auto-saved metadata for {len(dirty_photos)} photos.", 2000)
+    # --- MODIFIED ---
     def cleanup(self):
+        self.save_all_dirty_files() # 위젯 정리 전 모든 변경사항을 파일에 저장
         self._loader_stop = True
         try:
             while True:
@@ -2172,10 +2590,6 @@ class AppWindow(QMainWindow):
         self.stack.setCurrentWidget(self.culling_widget)
         self.update_toolbar_state(is_culling=True)
 
-    def save_selections(self):
-        if self.culling_widget:
-            self.culling_widget.save_selections()
-
     def open_settings(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec():
@@ -2212,9 +2626,9 @@ class AppWindow(QMainWindow):
                     p = os.path.join(folder, fn)
                     if not os.path.isfile(p):
                         continue
-                    ext = os.path.splitext(fn)[1].lower()
-                    if ext in exts:
-                        out[os.path.splitext(fn)[0]] = p
+                    base, ext = os.path.splitext(fn)
+                    if ext.lower() in exts:
+                        out[base] = p
             except Exception:
                 pass
             return out
@@ -2223,7 +2637,7 @@ class AppWindow(QMainWindow):
             return 0, "", 0, "", 0, 0, 0
 
         cw = self.culling_widget
-        cw.save_selections()
+        cw.save_all_dirty_files() # MODIFIED
 
         selected_raw_paths = [p.path for p in cw.catalog.photos if p.selected]
         selected_count = len(selected_raw_paths)
@@ -2237,7 +2651,7 @@ class AppWindow(QMainWindow):
         selected_raw_by_base = {os.path.splitext(os.path.basename(p))[0]: p for p in selected_raw_paths}
         root_jpegs_by_base = _list_by_basename(root, {'.jpg', '.jpeg'})
 
-        dest_raw_by_base = _list_by_basename(raw_out_dir, SUPPORTED_EXTS)
+        dest_raw_by_base = _list_by_basename(raw_out_dir, SUPPORTED_EXTS.union({'.xmp'}))
         dest_jpg_by_base = _list_by_basename(jpeg_out_dir, {'.jpg', '.jpeg'})
 
         copied_raw = 0
@@ -2254,6 +2668,11 @@ class AppWindow(QMainWindow):
                 if _needs_copy(src_path, dst_path):
                     shutil.copy2(src_path, dst_path)
                     copied_raw += 1
+                # Also copy XMP sidecar if it exists
+                src_xmp = os.path.splitext(src_path)[0] + '.xmp'
+                dst_xmp = os.path.splitext(dst_path)[0] + '.xmp'
+                if os.path.exists(src_xmp) and _needs_copy(src_xmp, dst_xmp):
+                    shutil.copy2(src_xmp, dst_xmp)
             except Exception as e:
                 print(f"[RAW sync] copy failed: {src_path} -> {dst_path}: {e}")
 
@@ -2341,7 +2760,7 @@ class AppWindow(QMainWindow):
         
     def closeEvent(self, event):
         if self.culling_widget:
-            self.culling_widget.save_selections()
+            # The cleanup method now handles saving all dirty files.
             self.culling_widget.cleanup()
         event.accept()
 
