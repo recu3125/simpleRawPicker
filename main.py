@@ -3,7 +3,7 @@
 
 import os, sys, io, json, time, shutil, argparse
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from datetime import datetime
 import threading
 from collections import OrderedDict
@@ -20,13 +20,43 @@ import numpy as np
 from PIL import Image, ImageQt, ImageOps
 import rawpy
 
-from PySide6.QtCore import Qt, QSize, QRect, QRectF, QPoint, QTimer, QObject, Signal, Slot, QEvent, QElapsedTimer, QStandardPaths
-from PySide6.QtGui import QPixmap, QKeySequence, QAction, QPainter, QPen, QColor, QFontDatabase, QFont, QIcon, QImage, QPolygon, QPainterPath, QBrush
+from PySide6.QtCore import (
+    Qt,
+    QSize,
+    QRect,
+    QRectF,
+    QPoint,
+    QTimer,
+    QObject,
+    Signal,
+    Slot,
+    QEvent,
+    QElapsedTimer,
+    QStandardPaths,
+    QThread,
+    QEventLoop,
+)
+from PySide6.QtGui import (
+    QPixmap,
+    QKeySequence,
+    QAction,
+    QPainter,
+    QPen,
+    QColor,
+    QFontDatabase,
+    QFont,
+    QIcon,
+    QImage,
+    QPolygon,
+    QPainterPath,
+    QBrush,
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QMessageBox, QFrame,
     QStatusBar, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStackedWidget,
     QToolBar, QDialog, QFormLayout, QSpinBox, QLineEdit, QDialogButtonBox,
-    QSizePolicy, QGroupBox, QGraphicsDropShadowEffect, QRadioButton, QSpacerItem
+    QSizePolicy, QGroupBox, QGraphicsDropShadowEffect, QRadioButton, QSpacerItem,
+    QProgressDialog,
 )
 
 def _prof_enabled():
@@ -52,9 +82,38 @@ SUPPORTED_EXTS = {
 }
 
 _XMP_GLOBAL_LOCK = threading.Lock()
+_XMP_ALERTED: Set[str] = set()
+
+
+def _schedule_on_main_thread(fn):
+    app = QApplication.instance()
+    if not app:
+        return False
+    QTimer.singleShot(0, fn)
+    return True
+
+
+def _notify_xmp_read_failure(path: str, error: Exception):
+    key = os.path.abspath(path)
+    if key in _XMP_ALERTED:
+        return
+    _XMP_ALERTED.add(key)
+
+    def _show_dialog():
+        QMessageBox.warning(
+            None,
+            "XMP Read Error",
+            f"Failed to read XMP sidecar for {os.path.basename(path)}.\n\n{error}",
+        )
+
+    if not _schedule_on_main_thread(_show_dialog):
+        print(f"Warning: Failed to read XMP for {os.path.basename(path)}: {error}")
+
+
 def read_xmp_sidecar(path: str) -> Dict:
     """Reads rating, label, and pick status from an XMP sidecar file."""
-    if exiv2 is None: return {}
+    if exiv2 is None:
+        return {}
     xmp_path = os.path.splitext(path)[0] + '.xmp'
 
     with _XMP_GLOBAL_LOCK:
@@ -62,62 +121,104 @@ def read_xmp_sidecar(path: str) -> Dict:
             if not os.path.exists(xmp_path) or os.path.getsize(xmp_path) == 0:
                 return {}
         except FileNotFoundError:
-            return {} # File might have been deleted between os.path.exists and os.path.getsize
+            return {}
 
-        # If file exists and is not empty, try to read it with retries for robustness.
+        last_error: Optional[Exception] = None
         for attempt in range(3):
             try:
                 img = exiv2.ImageFactory.open(xmp_path)
                 img.readMetadata()
                 xmp = img.xmpData()
-                
-                data = {}
+
+                data: Dict[str, Optional[object]] = {}
                 if 'Xmp.xmp.Rating' in xmp:
-                    data['rating'] = int(xmp['Xmp.xmp.Rating'].print())
+                    try:
+                        data['rating'] = int(xmp['Xmp.xmp.Rating'].print())
+                    except (ValueError, TypeError):
+                        data['rating'] = 0
                 if 'Xmp.xmp.Label' in xmp:
                     data['color_label'] = xmp['Xmp.xmp.Label'].print()
                 if 'Xmp.photoshop.Urgency' in xmp:
-                    urgency_val = int(xmp['Xmp.photoshop.Urgency'].print())
-                    data['selected'] = urgency_val == 1
+                    try:
+                        urgency_val = int(xmp['Xmp.photoshop.Urgency'].print())
+                    except (ValueError, TypeError):
+                        urgency_val = 0
+                    data['selected'] = (urgency_val == 1)
                 return data
             except exiv2.Exiv2Error as e:
-                if e.code == 21 and attempt < 2: # kerInputDataReadFailed
+                last_error = e
+                if getattr(e, 'code', None) == 21 and attempt < 2:  # kerInputDataReadFailed
                     time.sleep(0.05)
                     continue
-                print(f"Warning: Could not read XMP for {os.path.basename(path)}: {e}")
-                return {}
+                break
             except Exception as e:
-                print(f"Warning: Unexpected error reading XMP for {os.path.basename(path)}: {e}")
-                return {}
+                last_error = e
+                break
+
+        if last_error is not None:
+            _notify_xmp_read_failure(xmp_path, last_error)
         return {}
 
-def write_xmp_sidecar(path: str, data: Dict):
+def write_xmp_sidecar(path: str, data: Dict) -> bool:
     """Writes rating, label, or pick status to an XMP sidecar file."""
-    if exiv2 is None: return
+    if exiv2 is None:
+        return False
     xmp_path = os.path.splitext(path)[0] + '.xmp'
-    
+
     with _XMP_GLOBAL_LOCK:
         try:
-            raw_img = exiv2.ImageFactory.open(path)
-            raw_img.readMetadata()
-            
+            base_img = None
+            try:
+                base_img = exiv2.ImageFactory.open(path)
+                base_img.readMetadata()
+            except exiv2.Exiv2Error:
+                base_img = None
+
+            if base_img is None:
+                try:
+                    if os.path.exists(xmp_path):
+                        base_img = exiv2.ImageFactory.open(xmp_path)
+                        base_img.readMetadata()
+                    else:
+                        try:
+                            base_img = exiv2.ImageFactory.make(xmp_path, b"")
+                        except AttributeError:
+                            open(xmp_path, 'wb').close()
+                            base_img = exiv2.ImageFactory.open(xmp_path)
+                        try:
+                            base_img.readMetadata()
+                        except Exception:
+                            pass
+                except exiv2.Exiv2Error as e:
+                    print(f"Error opening XMP container for {os.path.basename(path)}: {e}")
+                    return False
+                except Exception as e:
+                    print(f"Error preparing XMP sidecar for {os.path.basename(path)}: {e}")
+                    return False
+
+            if base_img is None:
+                return False
+
             if os.path.exists(xmp_path):
                 try:
                     sidecar_img = exiv2.ImageFactory.open(xmp_path)
                     sidecar_img.readMetadata()
-                    raw_img.setXmpData(sidecar_img.xmpData())
+                    base_img.setXmpData(sidecar_img.xmpData())
                 except Exception:
                     pass
 
-            xmp = raw_img.xmpData()
+            xmp = base_img.xmpData()
 
             if 'rating' in data and data['rating'] is not None:
-                rating_val = int(data['rating'])
+                try:
+                    rating_val = int(data['rating'])
+                except (TypeError, ValueError):
+                    rating_val = 0
                 if rating_val == 0 and 'Xmp.xmp.Rating' in xmp:
-                     xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Rating')))
+                    xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Rating')))
                 elif rating_val > 0:
                     xmp['Xmp.xmp.Rating'] = str(rating_val)
-            
+
             if 'color_label' in data:
                 label_val = data['color_label']
                 if label_val:
@@ -129,10 +230,11 @@ def write_xmp_sidecar(path: str, data: Dict):
                 xmp['Xmp.photoshop.Urgency'] = str(1 if data['selected'] else 0)
 
             with open(xmp_path, 'w', encoding='utf-8') as f:
-                f.write(raw_img.xmpPacket())
-
+                f.write(base_img.xmpPacket())
+            return True
         except Exception as e:
             print(f"Error writing XMP for {os.path.basename(path)}: {e}")
+            return False
 
 
 def read_exif_datetime(path: str) -> Optional[datetime]:
@@ -272,7 +374,7 @@ def _open_jpeg_transposed(path: str) -> Image.Image:
     except Exception: pass
     return img
 
-def load_half_pil(path: str) -> Image.Image:
+def load_half_pil(path: str) -> Optional[Image.Image]:
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext in {'.jpg', '.jpeg'}:
@@ -290,10 +392,14 @@ def load_half_pil(path: str) -> Image.Image:
                     demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR
                 )
             return Image.fromarray(rgb)
-    except Exception:
-        return Image.new('RGB', (16, 16), (0, 0, 0))
+    except rawpy.LibRawError as e:
+        print(f"RAW decode failed (half) for {os.path.basename(path)}: {e}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error decoding {os.path.basename(path)} (half): {e}")
+        return None
 
-def load_full_pil(path: str) -> Image.Image:
+def load_full_pil(path: str) -> Optional[Image.Image]:
     ext = os.path.splitext(path)[1]
     try:
         if ext.lower() in {'.jpg', '.jpeg'}:
@@ -307,8 +413,12 @@ def load_full_pil(path: str) -> Image.Image:
                     demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR
                 )
             return Image.fromarray(rgb)
-    except Exception:
-        return Image.new('RGB', (16, 16), (0, 0, 0))
+    except rawpy.LibRawError as e:
+        print(f"RAW decode failed (full) for {os.path.basename(path)}: {e}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error decoding {os.path.basename(path)} (full): {e}")
+        return None
 
 def _jpeg_exif_as_meta(path: str) -> Dict[str, str]:
     meta: Dict[str, str] = {}
@@ -413,6 +523,8 @@ class Photo:
     xmp_loaded: bool = False  # XMP 파일을 읽었는지 여부
     is_dirty: bool = False    # 메모리 상태가 파일과 다른지 여부
     is_saving: bool = False   # 파일에 저장하는 작업이 진행 중인지 여부
+    version: int = 0
+    last_saved_version: int = 0
 
     def update_xmp(self, data: Dict):
         """메모리 상태를 변경하고 dirty 플래그를 설정합니다."""
@@ -426,12 +538,50 @@ class Photo:
         if 'selected' in data and self.selected != data['selected']:
             self.selected = data['selected']
             changed = True
-        
+
         if changed:
+            self.version += 1
             self.is_dirty = True
             # 사용자가 다시 수정했으므로, 진행 중이던 저장 작업은 의미가 없어집니다.
             # is_saving 상태를 초기화하여 새로운 변경사항이 덮어써지는 것을 방지합니다.
             self.is_saving = False
+
+class CatalogIndexWorker(QObject):
+    progress = Signal(int, int)
+    finished = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, paths: List[str]):
+        super().__init__()
+        self.paths = paths
+        self._cancelled = False
+
+    @Slot()
+    def cancel(self):
+        self._cancelled = True
+
+    @Slot()
+    def run(self):
+        items: List[Tuple[datetime, str, int]] = []
+        total = len(self.paths)
+        try:
+            for idx, path in enumerate(self.paths, 1):
+                if self._cancelled:
+                    break
+                dt = read_exif_datetime(path)
+                try:
+                    size = os.path.getsize(path)
+                except Exception:
+                    size = 0
+                if dt:
+                    items.append((dt, path, size))
+                self.progress.emit(idx, total)
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+
+        items.sort(key=lambda x: x[0])
+        self.finished.emit(items)
 
 class Catalog:
     def __init__(self, root: str):
@@ -452,15 +602,95 @@ class Catalog:
             return
             
     def _index(self):
-        items: List[Tuple[datetime, str, int]] = []
-        for p in self._iter_files():
-            dt = read_exif_datetime(p)
-            if not dt: continue
-            try: sz = os.path.getsize(p)
-            except Exception: sz = 0
-            items.append((dt, p, sz))
-        items.sort(key=lambda x: x[0])
-        self.photos = [Photo(path=p, timestamp=dt, filesize=sz) for dt, p, sz in items]
+        paths = list(self._iter_files())
+        if not paths:
+            self.photos = []
+            return
+
+        app = QApplication.instance()
+        if app is None or len(paths) < 200:
+            items: List[Tuple[datetime, str, int]] = []
+            for p in paths:
+                dt = read_exif_datetime(p)
+                if not dt:
+                    continue
+                try:
+                    sz = os.path.getsize(p)
+                except Exception:
+                    sz = 0
+                items.append((dt, p, sz))
+            items.sort(key=lambda x: x[0])
+            self.photos = [Photo(path=p, timestamp=dt, filesize=sz) for dt, p, sz in items]
+            return
+
+        worker = CatalogIndexWorker(paths)
+        thread = QThread()
+        worker.moveToThread(thread)
+
+        progress = QProgressDialog("Indexing RAW files…", "Cancel", 0, len(paths))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.setWindowTitle("Loading Photos")
+
+        loop = QEventLoop()
+        items_result: List[Tuple[datetime, str, int]] = []
+        error_messages: List[str] = []
+
+        def _on_progress(current: int, total: int):
+            if total <= 0:
+                progress.setMaximum(0)
+            else:
+                if progress.maximum() != total:
+                    progress.setMaximum(total)
+                progress.setValue(min(current, total))
+
+        def _on_finished(items: List[Tuple[datetime, str, int]]):
+            items_result.extend(items)
+            progress.reset()
+            loop.quit()
+
+        def _on_failed(message: str):
+            error_messages.append(message)
+            progress.reset()
+            loop.quit()
+
+        worker.progress.connect(_on_progress)
+        worker.finished.connect(_on_finished)
+        worker.failed.connect(_on_failed)
+        progress.canceled.connect(worker.cancel)
+        thread.started.connect(worker.run)
+
+        thread.start()
+        progress.show()
+        loop.exec()
+
+        progress.close()
+        progress.deleteLater()
+        worker.deleteLater()
+        thread.quit()
+        thread.wait()
+
+        if error_messages and not items_result:
+            print(f"Error indexing catalog: {error_messages[0]}")
+            items_result = []
+
+        if not items_result:
+            # Fall back to synchronous processing if nothing was collected (e.g., canceled)
+            items: List[Tuple[datetime, str, int]] = []
+            for p in paths:
+                dt = read_exif_datetime(p)
+                if not dt:
+                    continue
+                try:
+                    sz = os.path.getsize(p)
+                except Exception:
+                    sz = 0
+                items.append((dt, p, sz))
+            items.sort(key=lambda x: x[0])
+            items_result = items
+
+        self.photos = [Photo(path=p, timestamp=dt, filesize=sz) for dt, p, sz in items_result]
 
     def total_photos(self) -> int:
         return len(self.photos)
@@ -743,6 +973,14 @@ class ImageView(QLabel):
                     try:
                         tgt = geom["target"]
                         box = geom["src_pil"]
+                        left, top, right, bottom = box
+                        left = max(0, min(left, src.width))
+                        top = max(0, min(top, src.height))
+                        right = max(left, min(right, src.width))
+                        bottom = max(top, min(bottom, src.height))
+                        if right <= left or bottom <= top:
+                            return
+                        box = (int(left), int(top), int(right), int(bottom))
                         dpr = painter.device().devicePixelRatioF()
                         if self._mode == 'fit':
                           self._pm_rect = QRect(int(tgt.x()), int(tgt.y()), int(tgt.width()), int(tgt.height()))
@@ -890,6 +1128,9 @@ class ImageView(QLabel):
         s_old = self._zoom
         T_old = self._top_left
 
+        if abs(s_old) < 1e-9:
+            return
+
         u_img_x = (c.x() - T_old.x()) / s_old
         u_img_y = (c.y() - T_old.y()) / s_old
         self._zoom = new_zoom
@@ -937,6 +1178,8 @@ class ImageView(QLabel):
             factor = 1.25 ** step_unit
             s_old = self._zoom
             T_old = self._top_left
+            if abs(s_old) < 1e-9:
+                break
             u_img_x = (c.x() - T_old.x()) / s_old
             u_img_y = (c.y() - T_old.y()) / s_old
             self._zoom = min(12.0, max(0.05, self._zoom * factor))
@@ -1172,6 +1415,7 @@ class LoaderSignals(QObject):
     xmp = Signal(str, dict)
     thumb_ready = Signal(str, int, object)
     resized_pixmap_ready = Signal(str, QSize, object)
+    load_failed = Signal(str, str, str)
 
 @dataclass
 class AppSettings:
@@ -1243,9 +1487,14 @@ class CullingWidget(QWidget):
         self.cache_resized_limit = 32
         self.cache_full_limit = 32
         self.cache_half_limit = 64
+        self.cache_full_target_bytes = 512 * 1024 * 1024
+        self.cache_half_target_bytes = 384 * 1024 * 1024
         self.cache_lock = threading.Lock()
+        self._cache_full_bytes = 0
+        self._cache_half_bytes = 0
         self._pm_thumb_cache: Dict[Tuple[str,int], QPixmap] = {}
         self._pm_thumb_limit = 256
+        self._failed_loads: Set[str] = set()
 
         self.signals = LoaderSignals()
         self.signals.loaded.connect(self._on_loaded)
@@ -1253,6 +1502,7 @@ class CullingWidget(QWidget):
         self.signals.xmp.connect(self._on_xmp_ready)
         self.signals.thumb_ready.connect(self._on_thumb_ready)
         self.signals.resized_pixmap_ready.connect(self._on_resized_pixmap_ready)
+        self.signals.load_failed.connect(self._on_load_failed)
 
         self._taskq: PriorityQueue = PriorityQueue()
         self._task_counter = 0
@@ -1474,20 +1724,71 @@ class CullingWidget(QWidget):
             _plog(f"enqueue prio={priority} qsize={qsz}")
 
     def _touch(self, od: OrderedDict, key, limit: int):
-        if key in od: od.move_to_end(key)
+        if key in od:
+            od.move_to_end(key)
         while len(od) > limit:
             od.popitem(last=False)
 
+    def _estimate_pil_bytes(self, pil: Optional[Image.Image]) -> int:
+        if pil is None:
+            return 0
+        bands = max(1, len(pil.getbands()))
+        try:
+            return pil.width * pil.height * bands
+        except Exception:
+            return 0
+
+    def _enforce_memory_budget_locked(self):
+        while (
+            (self._cache_full_bytes > self.cache_full_target_bytes or len(self.pil_full_cache) > self.cache_full_limit)
+            and self.pil_full_cache
+        ):
+            _, old = self.pil_full_cache.popitem(last=False)
+            self._cache_full_bytes = max(0, self._cache_full_bytes - self._estimate_pil_bytes(old))
+        while (
+            (self._cache_half_bytes > self.cache_half_target_bytes or len(self.pil_half_cache) > self.cache_half_limit)
+            and self.pil_half_cache
+        ):
+            _, old = self.pil_half_cache.popitem(last=False)
+            self._cache_half_bytes = max(0, self._cache_half_bytes - self._estimate_pil_bytes(old))
+
     def _get_pil_full_cached(self, path: str) -> Optional[Image.Image]:
-        with self.cache_lock: return self.pil_full_cache.get(path)
+        with self.cache_lock:
+            pil = self.pil_full_cache.get(path)
+            if pil is not None:
+                self.pil_full_cache.move_to_end(path)
+            return pil
+
     def _get_pil_half_cached(self, path: str) -> Optional[Image.Image]:
-        with self.cache_lock: return self.pil_half_cache.get(path)
-    def _put_pil_full(self, path: str, pil: Image.Image):
         with self.cache_lock:
-            self.pil_full_cache[path] = pil; self._touch(self.pil_full_cache, path, self.cache_full_limit)
-    def _put_pil_half(self, path: str, pil: Image.Image):
+            pil = self.pil_half_cache.get(path)
+            if pil is not None:
+                self.pil_half_cache.move_to_end(path)
+            return pil
+
+    def _put_pil_full(self, path: str, pil: Optional[Image.Image]):
+        if pil is None:
+            return
         with self.cache_lock:
-            self.pil_half_cache[path] = pil; self._touch(self.pil_half_cache, path, self.cache_half_limit)
+            old = self.pil_full_cache.pop(path, None)
+            if old is not None:
+                self._cache_full_bytes = max(0, self._cache_full_bytes - self._estimate_pil_bytes(old))
+            self.pil_full_cache[path] = pil
+            self._cache_full_bytes += self._estimate_pil_bytes(pil)
+            self.pil_full_cache.move_to_end(path)
+            self._enforce_memory_budget_locked()
+
+    def _put_pil_half(self, path: str, pil: Optional[Image.Image]):
+        if pil is None:
+            return
+        with self.cache_lock:
+            old = self.pil_half_cache.pop(path, None)
+            if old is not None:
+                self._cache_half_bytes = max(0, self._cache_half_bytes - self._estimate_pil_bytes(old))
+            self.pil_half_cache[path] = pil
+            self._cache_half_bytes += self._estimate_pil_bytes(pil)
+            self.pil_half_cache.move_to_end(path)
+            self._enforce_memory_budget_locked()
     def _put_resized_pixmap(self, path: str, size: QSize, pixmap: QPixmap):
         key = (path, size.width(), size.height())
         with self.cache_lock:
@@ -1505,6 +1806,8 @@ class CullingWidget(QWidget):
         self._post_task(priority, _wrap, *args)
 
     def _enqueue_load(self, path: str, kind: str, priority: int):
+        if path in self._failed_loads:
+            return
         key = (path, kind); self._enqueue(priority, key, self._worker_entry, path, kind)
     def _enqueue_meta(self, path: str):
         key = (path, 'meta'); self._enqueue(-89, key, self._worker_entry, path, 'meta')
@@ -1522,13 +1825,21 @@ class CullingWidget(QWidget):
         if kind == 'half':
             with _ptime(f"worker half postprocess {os.path.basename(path)}", warn_ms=40):
                 pil = load_half_pil(path)
-            self._put_pil_half(path, pil); self.signals.loaded.emit(path, 'half')
+            if pil is None:
+                self.signals.load_failed.emit(path, 'half', 'decode')
+                return
+            self._put_pil_half(path, pil)
+            self.signals.loaded.emit(path, 'half')
         elif kind == 'full':
             self._acquire_full_slot()
             try:
                 with _ptime(f"worker full postprocess {os.path.basename(path)}", warn_ms=80):
                     pil = load_full_pil(path)
-                self._put_pil_full(path, pil); self.signals.loaded.emit(path, 'full')
+                if pil is None:
+                    self.signals.load_failed.emit(path, 'full', 'decode')
+                    return
+                self._put_pil_full(path, pil)
+                self.signals.loaded.emit(path, 'full')
             finally:
                 self._release_full_slot()
         elif kind == 'meta':
@@ -1847,7 +2158,11 @@ class CullingWidget(QWidget):
 
         # 사용자가 수정하지 않은 경우에만 파일에서 읽어온 데이터로 메모리를 업데이트합니다.
         has_changed = False
-        new_rating = data.get('rating', 0)
+        rating_raw = data.get('rating', 0)
+        try:
+            new_rating = int(rating_raw)
+        except (TypeError, ValueError):
+            new_rating = 0
         if photo.rating != new_rating:
             photo.rating = new_rating
             has_changed = True
@@ -1857,7 +2172,8 @@ class CullingWidget(QWidget):
             photo.color_label = new_label
             has_changed = True
 
-        new_selected = data.get('selected', photo.selected)
+        selected_raw = data.get('selected', photo.selected)
+        new_selected = bool(selected_raw)
         if photo.selected != new_selected:
             photo.selected = new_selected
             has_changed = True
@@ -1871,8 +2187,9 @@ class CullingWidget(QWidget):
             else:
                 # 현재 화면이 아닌 경우 필름 스트립만 업데이트해도 충분
                 self.filmstrip.update()
-            
+
             self._update_selected_badge_fast()
+        photo.last_saved_version = photo.version
         
     def _refresh_statusbar(self):
         if self.status_restore_timer.isActive(): return
@@ -1938,6 +2255,26 @@ class CullingWidget(QWidget):
             else: self.view.update()
             self._update_metadata(path)
         self._refresh_statusbar(); self.filmstrip.update()
+
+    @Slot(str, str, str)
+    def _on_load_failed(self, path: str, kind: str, reason: str):
+        first_failure = path not in self._failed_loads
+        self._failed_loads.add(path)
+
+        cur = self._current()
+        if cur and cur.path == path:
+            self.view.set_loading(False)
+            self.view.set_rendered_pixmap(None)
+            self.view.set_pils(None, None)
+            self.view.setText("Failed to load image")
+            self.view.update()
+
+        if first_failure:
+            message = f"Failed to load {os.path.basename(path)} ({kind})."
+            if reason == 'decode':
+                message = f"Unable to decode RAW data for {os.path.basename(path)}."
+            QMessageBox.warning(self, "Load Error", message)
+        self._refresh_statusbar()
 
     @Slot(str, QSize, object)
     def _on_resized_pixmap_ready(self, path: str, size: QSize, qimg_obj):
@@ -2079,9 +2416,24 @@ class CullingWidget(QWidget):
             print(f"Error saving selections.json: {e}")
 
         # 2. 변경된 XMP 파일들 저장 로직 수정
-        dirty_photos = [p for p in self.catalog.photos if p.is_dirty]
+        dirty_photos = [p for p in self.catalog.photos if p.is_dirty and not p.is_saving]
         if not dirty_photos:
             return
+
+        def _write_task_with_cleanup(path, data, photo_obj, version_snapshot, retries_left):
+            success = write_xmp_sidecar(path, data)
+            if not success:
+                if photo_obj.version == version_snapshot:
+                    photo_obj.is_dirty = True
+                photo_obj.is_saving = False
+                if retries_left > 0:
+                    self._post_task(10, _write_task_with_cleanup, path, data, photo_obj, version_snapshot, retries_left - 1)
+                return
+
+            if photo_obj.version == version_snapshot:
+                photo_obj.is_dirty = False
+                photo_obj.last_saved_version = version_snapshot
+            photo_obj.is_saving = False
 
         for photo in dirty_photos:
             data_to_write = {
@@ -2089,23 +2441,8 @@ class CullingWidget(QWidget):
                 'color_label': photo.color_label,
                 'selected': photo.selected
             }
-
-            # --- NEW ---
-            # 백그라운드 작업 완료 후 Photo 객체의 상태를 업데이트할 함수를 정의합니다.
-            # 이 함수는 백그라운드 스레드에서 직접 Photo 객체를 수정합니다.
-            # (단순 플래그 변경이라 스레드 충돌 위험이 거의 없어 안전합니다.)
-            def _write_task_with_cleanup(path, data, photo_obj):
-                try:
-                    write_xmp_sidecar(path, data)
-                finally:
-                    # 파일 쓰기가 성공하든 실패하든, '저장 중' 상태는 해제합니다.
-                    photo_obj.is_saving = False
-
-            # 백그라운드 워커에게 쓰기 작업과 정리 작업을 포함한 래퍼 함수를 전달합니다.
-            self._post_task(20, _write_task_with_cleanup, photo.path, data_to_write, photo)
-            
-            # Photo의 상태를 'dirty'에서 'saving'으로 전환합니다.
-            photo.is_dirty = False
+            version_snapshot = photo.version
+            self._post_task(20, _write_task_with_cleanup, photo.path, data_to_write, photo, version_snapshot, 2)
             photo.is_saving = True
 
         self._show_temporary_status(f"Auto-saved metadata for {len(dirty_photos)} photos.", 2000)
