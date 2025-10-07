@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import os, sys, io, json, time, shutil, argparse
 from dataclasses import dataclass, field
@@ -20,14 +19,20 @@ import numpy as np
 from PIL import Image, ImageQt, ImageOps
 import rawpy
 
-from PySide6.QtCore import Qt, QSize, QRect, QRectF, QPoint, QTimer, QObject, Signal, Slot, QEvent, QElapsedTimer, QStandardPaths
+from PySide6.QtCore import Qt, QSize, QRect, QRectF, QPoint, QTimer, QObject, Signal, Slot, QEvent, QElapsedTimer, QStandardPaths, QEventLoop, QThread
 from PySide6.QtGui import QPixmap, QKeySequence, QAction, QPainter, QPen, QColor, QFontDatabase, QFont, QIcon, QImage, QPolygon, QPainterPath, QBrush
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QMessageBox, QFrame,
     QStatusBar, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStackedWidget,
     QToolBar, QDialog, QFormLayout, QSpinBox, QLineEdit, QDialogButtonBox,
-    QSizePolicy, QGroupBox, QGraphicsDropShadowEffect, QRadioButton, QSpacerItem
+    QSizePolicy, QGroupBox, QGraphicsDropShadowEffect, QRadioButton, QSpacerItem,
+    QProgressDialog
 )
+
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 def _prof_enabled():
     app = QApplication.instance()
@@ -52,26 +57,46 @@ SUPPORTED_EXTS = {
 }
 
 _XMP_GLOBAL_LOCK = threading.Lock()
-def read_xmp_sidecar(path: str) -> Dict:
+
+
+def _schedule_xmp_warning(xmp_path: str, error: Exception, parent=None) -> None:
+    app = QApplication.instance()
+    message = f"{xmp_path}\n{error}"
+
+    if not app:
+        print(f"Warning: XMP read failure for {os.path.basename(xmp_path)}: {error}")
+        return
+
+    def _show_dialog():
+        widget = parent if parent is not None else app.activeWindow()
+        QMessageBox.warning(widget, "XMP 읽기 실패", message)
+
+    QTimer.singleShot(0, _show_dialog)
+
+
+def read_xmp_sidecar(path: str, retries: int = 2, delay: float = 0.5, parent=None) -> Dict:
     """Reads rating, label, and pick status from an XMP sidecar file."""
-    if exiv2 is None: return {}
-    xmp_path = os.path.splitext(path)[0] + '.xmp'
+    if exiv2 is None:
+        return {}
+
+    xmp_path = path if path.lower().endswith('.xmp') else os.path.splitext(path)[0] + '.xmp'
+    error_to_warn: Optional[Exception] = None
+    last_error: Optional[Exception] = None
 
     with _XMP_GLOBAL_LOCK:
         try:
             if not os.path.exists(xmp_path) or os.path.getsize(xmp_path) == 0:
                 return {}
-        except FileNotFoundError:
-            return {} # File might have been deleted between os.path.exists and os.path.getsize
+        except OSError:
+            return {}
 
-        # If file exists and is not empty, try to read it with retries for robustness.
-        for attempt in range(3):
+        for attempt in range(retries + 1):
             try:
                 img = exiv2.ImageFactory.open(xmp_path)
                 img.readMetadata()
                 xmp = img.xmpData()
-                
-                data = {}
+
+                data: Dict[str, Optional[str]] = {}
                 if 'Xmp.xmp.Rating' in xmp:
                     data['rating'] = int(xmp['Xmp.xmp.Rating'].print())
                 if 'Xmp.xmp.Label' in xmp:
@@ -81,64 +106,102 @@ def read_xmp_sidecar(path: str) -> Dict:
                     data['selected'] = urgency_val == 1
                 return data
             except exiv2.Exiv2Error as e:
-                if e.code == 21 and attempt < 2: # kerInputDataReadFailed
-                    time.sleep(0.05)
-                    continue
-                print(f"Warning: Could not read XMP for {os.path.basename(path)}: {e}")
-                return {}
+                last_error = e
+                if attempt == retries:
+                    error_to_warn = e
+                    break
+                time.sleep(delay)
             except Exception as e:
-                print(f"Warning: Unexpected error reading XMP for {os.path.basename(path)}: {e}")
-                return {}
-        return {}
+                last_error = e
+                break
+
+    if error_to_warn is not None:
+        _schedule_xmp_warning(xmp_path, error_to_warn, parent)
+
+    if last_error is not None:
+        print(f"Warning: Could not read XMP for {os.path.basename(path)}: {last_error}")
+
+    return {}
+
 
 def write_xmp_sidecar(path: str, data: Dict):
     """Writes rating, label, or pick status to an XMP sidecar file."""
-    if exiv2 is None: return
+    if exiv2 is None:
+        return False
+
     xmp_path = os.path.splitext(path)[0] + '.xmp'
-    
+
     with _XMP_GLOBAL_LOCK:
+        image = None
         try:
-            raw_img = exiv2.ImageFactory.open(path)
-            raw_img.readMetadata()
-            
+            image = exiv2.ImageFactory.open(path)
+            image.readMetadata()
+        except exiv2.Exiv2Error:
+            image = None
+
+        if image is None:
+            try:
+                if os.path.exists(xmp_path):
+                    image = exiv2.ImageFactory.open(xmp_path)
+                    try:
+                        image.readMetadata()
+                    except exiv2.Exiv2Error:
+                        pass
+                else:
+                    image = exiv2.ImageFactory.make(xmp_path, b"")
+            except exiv2.Exiv2Error as e:
+                print(f"Error preparing XMP for {os.path.basename(path)}: {e}")
+                return False
+        else:
             if os.path.exists(xmp_path):
                 try:
                     sidecar_img = exiv2.ImageFactory.open(xmp_path)
                     sidecar_img.readMetadata()
-                    raw_img.setXmpData(sidecar_img.xmpData())
-                except Exception:
+                    image.setXmpData(sidecar_img.xmpData())
+                except exiv2.Exiv2Error:
                     pass
 
-            xmp = raw_img.xmpData()
+        try:
+            xmp = image.xmpData()
+        except Exception as e:
+            print(f"Error accessing XMP data for {os.path.basename(path)}: {e}")
+            return False
 
-            if 'rating' in data and data['rating'] is not None:
-                rating_val = int(data['rating'])
-                if rating_val == 0 and 'Xmp.xmp.Rating' in xmp:
-                     xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Rating')))
-                elif rating_val > 0:
-                    xmp['Xmp.xmp.Rating'] = str(rating_val)
-            
-            if 'color_label' in data:
-                label_val = data['color_label']
-                if label_val:
-                    xmp['Xmp.xmp.Label'] = str(label_val)
-                elif 'Xmp.xmp.Label' in xmp:
-                    xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Label')))
+        if 'rating' in data and data['rating'] is not None:
+            rating_val = int(data['rating'])
+            if rating_val == 0 and 'Xmp.xmp.Rating' in xmp:
+                xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Rating')))
+            elif rating_val > 0:
+                xmp['Xmp.xmp.Rating'] = str(rating_val)
 
-            if 'selected' in data and data['selected'] is not None:
-                xmp['Xmp.photoshop.Urgency'] = str(1 if data['selected'] else 0)
+        if 'color_label' in data:
+            label_val = data['color_label']
+            if label_val:
+                xmp['Xmp.xmp.Label'] = str(label_val)
+            elif 'Xmp.xmp.Label' in xmp:
+                xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Label')))
 
+        if 'selected' in data and data['selected'] is not None:
+            is_selected = data['selected']
+            urgency_key_str = 'Xmp.photoshop.Urgency'
+            if is_selected:
+                xmp[urgency_key_str] = '1'
+            elif urgency_key_str in xmp:
+                xmp[urgency_key_str] = '0'
+
+        try:
+            packet = image.xmpPacket()
             with open(xmp_path, 'w', encoding='utf-8') as f:
-                f.write(raw_img.xmpPacket())
-
+                f.write(packet)
         except Exception as e:
             print(f"Error writing XMP for {os.path.basename(path)}: {e}")
+            return False
 
+    return True
 
-def read_exif_datetime(path: str) -> Optional[datetime]:
-    ext = os.path.splitext(path)[1].lower()
+def read_exif_datetime(path: str, st: Optional[os.stat_result] = None) -> Optional[datetime]:
     try:
-        st = os.stat(path)
+        st = st or os.stat(path)
         ts = getattr(st, 'st_mtime_ns', None)
         if ts is not None:
             return datetime.fromtimestamp(ts / 1e9)
@@ -149,7 +212,7 @@ def read_exif_datetime(path: str) -> Optional[datetime]:
 def _pow2(x):
     try:
         return 2.0 ** float(x)
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 def _ratarr_to_tuple(v):
@@ -207,7 +270,8 @@ def _exif_to_meta(exif, meta: Dict[str, str]):
         try:
             avf = float(av) if isinstance(av, (int, float)) else av.numerator / av.denominator
             f = _pow2(avf / 2.0)
-            if f: updf('fnumber', f"{f:.1f}")
+            if f is not None:
+                updf('fnumber', f"{f:.1f}")
         except Exception:
             pass
 
@@ -228,7 +292,7 @@ def _exif_to_meta(exif, meta: Dict[str, str]):
         try:
             tvf = float(tv) if isinstance(tv, (int, float)) else tv.numerator / tv.denominator
             t = _pow2(-tvf)
-            if t:
+            if t is not None:
                 if t >= 1:
                     s = f"{t:.3f}".rstrip('0').rstrip('.')
                 else:
@@ -272,14 +336,14 @@ def _open_jpeg_transposed(path: str) -> Image.Image:
     except Exception: pass
     return img
 
-def load_half_pil(path: str) -> Image.Image:
+def load_half_pil(path: str) -> Optional[Image.Image]:
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext in {'.jpg', '.jpeg'}:
             pil = _open_jpeg_transposed(path)
             if max(pil.size) > 2400:
                 w, h = pil.size
-                pil = pil.resize((max(1,w//2), max(1,h//2)), Image.BILINEAR)
+                pil = pil.resize((max(1, w // 2), max(1, h // 2)), Image.BILINEAR)
             return pil
         with _ptime(f"rawpy half postprocess {os.path.basename(path)}", warn_ms=40):
             with rawpy.imread(path) as raw:
@@ -290,10 +354,13 @@ def load_half_pil(path: str) -> Image.Image:
                     demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR
                 )
             return Image.fromarray(rgb)
+    except rawpy.LibRawError as e:
+        print(f"RAW decode failed: {e}")
+        return None
     except Exception:
-        return Image.new('RGB', (16, 16), (0, 0, 0))
+        return None
 
-def load_full_pil(path: str) -> Image.Image:
+def load_full_pil(path: str) -> Optional[Image.Image]:
     ext = os.path.splitext(path)[1]
     try:
         if ext.lower() in {'.jpg', '.jpeg'}:
@@ -307,8 +374,27 @@ def load_full_pil(path: str) -> Image.Image:
                     demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR
                 )
             return Image.fromarray(rgb)
+    except rawpy.LibRawError as e:
+        print(f"RAW decode failed: {e}")
+        return None
     except Exception:
-        return Image.new('RGB', (16, 16), (0, 0, 0))
+        return None
+
+def _estimate_pil_bytes(pil: Optional[Image.Image]) -> int:
+    if pil is None:
+        return 0
+    try:
+        w, h = pil.size
+    except Exception:
+        return 0
+    if w <= 0 or h <= 0:
+        return 0
+    try:
+        bands = len(pil.getbands())
+    except Exception:
+        bands = 3
+    bands = max(1, bands)
+    return int(w * h * bands)
 
 def _jpeg_exif_as_meta(path: str) -> Dict[str, str]:
     meta: Dict[str, str] = {}
@@ -321,12 +407,6 @@ def _exiv2_read_meta_text(path: str) -> Dict[str, str]:
     if exiv2 is None:
         return {}
     try:
-        # The enableBMFF call is often deprecated and not needed.
-        # try:
-        #     if hasattr(exiv2, "enableBMFF"):
-        #         exiv2.enableBMFF()
-        # except Exception:
-        #     pass
         img = exiv2.ImageFactory.open(path)
         img.readMetadata()
         exif = img.exifData()
@@ -409,29 +489,84 @@ class Photo:
     rating: int = 0
     color_label: str = ""
     
-    # --- MODIFIED ---
-    xmp_loaded: bool = False  # XMP 파일을 읽었는지 여부
-    is_dirty: bool = False    # 메모리 상태가 파일과 다른지 여부
-    is_saving: bool = False   # 파일에 저장하는 작업이 진행 중인지 여부
+    xmp_loaded: bool = False  
+    is_dirty: bool = False    
+    is_saving: bool = False   
+    version: int = 0          
+    saving_version: int = 0   
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def update_xmp(self, data: Dict):
         """메모리 상태를 변경하고 dirty 플래그를 설정합니다."""
-        changed = False
-        if 'rating' in data and self.rating != data['rating']:
-            self.rating = data['rating']
-            changed = True
-        if 'color_label' in data and self.color_label != data['color_label']:
-            self.color_label = data['color_label']
-            changed = True
-        if 'selected' in data and self.selected != data['selected']:
-            self.selected = data['selected']
-            changed = True
-        
-        if changed:
-            self.is_dirty = True
-            # 사용자가 다시 수정했으므로, 진행 중이던 저장 작업은 의미가 없어집니다.
-            # is_saving 상태를 초기화하여 새로운 변경사항이 덮어써지는 것을 방지합니다.
-            self.is_saving = False
+        with self.lock:
+            changed = False
+            if 'rating' in data and self.rating != data['rating']:
+                self.rating = data['rating']
+                changed = True
+            if 'color_label' in data and self.color_label != data['color_label']:
+                self.color_label = data['color_label']
+                changed = True
+            if 'selected' in data and self.selected != data['selected']:
+                self.selected = data['selected']
+                changed = True
+
+            if changed:
+                self.version += 1
+                self.is_dirty = True
+
+class IndexWorker(QObject):
+    progress = Signal(int)
+    maximum = Signal(int)
+    finished = Signal(list)
+
+    def run(self, root: str):
+        items: List[Tuple[datetime, str, int]] = []
+        try:
+            entries = []
+            with os.scandir(root) as it:
+                for entry in it:
+                    try:
+                        if not entry.is_file():
+                            continue
+                    except OSError:
+                        continue
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    if ext in SUPPORTED_EXTS:
+                        entries.append(entry)
+        except FileNotFoundError:
+            print(f"Warning: Directory not found: {root}")
+            self.maximum.emit(0)
+            self.finished.emit([])
+            return
+        except Exception as e:
+            print(f"Error scanning directory {root}: {e}")
+            self.maximum.emit(0)
+            self.finished.emit([])
+            return
+
+        entries.sort(key=lambda e: e.name)
+        total = len(entries)
+        self.maximum.emit(total)
+
+        for idx, entry in enumerate(entries, start=1):
+            path = entry.path
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except Exception:
+                st = None
+            dt = read_exif_datetime(path, st)
+            if not dt:
+                self.progress.emit(idx)
+                continue
+            try:
+                sz = st.st_size if st is not None else os.path.getsize(path)
+            except Exception:
+                sz = 0
+            items.append((dt, path, sz))
+            self.progress.emit(idx)
+
+        items.sort(key=lambda x: x[0])
+        self.finished.emit(items)
 
 class Catalog:
     def __init__(self, root: str):
@@ -441,26 +576,102 @@ class Catalog:
 
     def _iter_files(self):
         try:
-            for fn in os.listdir(self.root):
-                path = os.path.join(self.root, fn)
-                if os.path.isfile(path):
-                    ext = os.path.splitext(fn)[1]
-                    if ext in SUPPORTED_EXTS or ext.lower() in SUPPORTED_EXTS:
-                        yield path
+            with os.scandir(self.root) as it:
+                for entry in it:
+                    try:
+                        if not entry.is_file():
+                            continue
+                    except OSError:
+                        continue
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    if ext in SUPPORTED_EXTS:
+                        yield entry
         except FileNotFoundError:
             print(f"Warning: Directory not found: {self.root}")
             return
-            
+
     def _index(self):
-        items: List[Tuple[datetime, str, int]] = []
-        for p in self._iter_files():
-            dt = read_exif_datetime(p)
-            if not dt: continue
-            try: sz = os.path.getsize(p)
-            except Exception: sz = 0
-            items.append((dt, p, sz))
-        items.sort(key=lambda x: x[0])
-        self.photos = [Photo(path=p, timestamp=dt, filesize=sz) for dt, p, sz in items]
+        def _scan_sync() -> List[Tuple[datetime, str, int]]:
+            entries = list(self._iter_files())
+            entries.sort(key=lambda e: e.name)
+            items: List[Tuple[datetime, str, int]] = []
+            for entry in entries:
+                path = entry.path
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except Exception:
+                    st = None
+                dt = read_exif_datetime(path, st)
+                if not dt:
+                    continue
+                try:
+                    sz = st.st_size if st is not None else os.path.getsize(path)
+                except Exception:
+                    sz = 0
+                items.append((dt, path, sz))
+            items.sort(key=lambda x: x[0])
+            return items
+
+        app = QApplication.instance()
+        if app is None or QThread.currentThread() != app.thread():
+            items = _scan_sync()
+            self.photos = [Photo(path=p, timestamp=dt, filesize=sz) for dt, p, sz in items]
+            return
+
+        loop = QEventLoop()
+        results: List[Tuple[datetime, str, int]] = []
+        progress_holder: Dict[str, Optional[QProgressDialog]] = {'dialog': None}
+
+        worker = IndexWorker()
+        thread = QThread()
+        worker.moveToThread(thread)
+
+        def handle_finished(items: List[Tuple[datetime, str, int]]):
+            nonlocal results
+            results = items
+            loop.quit()
+
+        def handle_maximum(total: int):
+            dlg = progress_holder.get('dialog')
+            if total < 200:
+                if dlg:
+                    dlg.setMaximum(total)
+                return
+            if dlg is None:
+                parent = app.activeWindow()
+                dlg = QProgressDialog("Indexing photos…", "", 0, total, parent)
+                dlg.setCancelButton(None)
+                dlg.setWindowModality(Qt.WindowModal)
+                dlg.setMinimumDuration(0)
+                dlg.setValue(0)
+                progress_holder['dialog'] = dlg
+            else:
+                dlg.setMaximum(total)
+                dlg.setValue(0)
+            QApplication.processEvents()
+
+        def handle_progress(value: int):
+            dlg = progress_holder.get('dialog')
+            if dlg:
+                dlg.setValue(min(value, dlg.maximum()))
+                QApplication.processEvents()
+
+        worker.finished.connect(handle_finished)
+        worker.maximum.connect(handle_maximum)
+        worker.progress.connect(handle_progress)
+        thread.started.connect(lambda: worker.run(self.root))
+
+        thread.start()
+        loop.exec()
+        thread.quit()
+        thread.wait()
+        worker.deleteLater()
+
+        dialog = progress_holder.get('dialog')
+        if dialog:
+            dialog.close()
+
+        self.photos = [Photo(path=p, timestamp=dt, filesize=sz) for dt, p, sz in results]
 
     def total_photos(self) -> int:
         return len(self.photos)
@@ -667,6 +878,8 @@ class ImageView(QLabel):
             return None
 
         base_w, base_h = base.width, base.height
+        if base_w <= 0 or base_h <= 0 or src.width <= 0 or src.height <= 0:
+            return None
 
         if self._mode == 'fit':
             if self._pm_rect.isValid():
@@ -724,15 +937,30 @@ class ImageView(QLabel):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#1e1e1e"))
 
+        if self._selected:
+            rect_to_draw = self._pm_rect
+            if self._mode == 'zoom' and self._pil_base and self._pil_base.width > 0 and self._pil_base.height > 0:
+                rect_to_draw = QRect(
+                    self._top_left,
+                    QSize(int(self._pil_base.width * self._zoom), int(self._pil_base.height * self._zoom))
+                )
+            
+            if rect_to_draw.isValid():
+                padding = 6 
+                background_frame = rect_to_draw.adjusted(-padding, -padding, padding, padding)
+                painter.fillRect(background_frame, QColor("#4CEF50"))
+
         if (self._rendered_pixmap and not self._rendered_pixmap.isNull() 
                 and not self.show_hdr):
             if self._mode == 'fit':
                 painter.drawPixmap(self._pm_rect, self._rendered_pixmap)
             else:
                 base = self._pil_base
-                if base:
-                    target_rect = QRect(self._top_left, QSize(int(base.width * self._zoom),
-                                                              int(base.height * self._zoom)))
+                if base and base.width > 0 and base.height > 0:
+                    target_rect = QRect(
+                        self._top_left,
+                        QSize(int(base.width * self._zoom), int(base.height * self._zoom))
+                    )
                     painter.drawPixmap(target_rect, self._rendered_pixmap, self._rendered_pixmap.rect())
 
         else:
@@ -743,6 +971,14 @@ class ImageView(QLabel):
                     try:
                         tgt = geom["target"]
                         box = geom["src_pil"]
+                        x0 = max(0, int(box[0]))
+                        y0 = max(0, int(box[1]))
+                        x1 = min(src.width, int(box[2]))
+                        y1 = min(src.height, int(box[3]))
+                        if x1 <= x0 or y1 <= y0:
+                            return
+
+                        clipped_box = (x0, y0, x1, y1)
                         dpr = painter.device().devicePixelRatioF()
                         if self._mode == 'fit':
                           self._pm_rect = QRect(int(tgt.x()), int(tgt.y()), int(tgt.width()), int(tgt.height()))
@@ -752,7 +988,7 @@ class ImageView(QLabel):
                         th = max(1, int(tgt.height() * dpr * quality_scaler))
 
                         resize_filter = Image.BILINEAR
-                        roi = src.crop(box).resize((tw, th), resize_filter)
+                        roi = src.crop(clipped_box).resize((tw, th), resize_filter)
 
                         if self.show_hdr:
                             if self._hdr_lut is None:
@@ -774,13 +1010,6 @@ class ImageView(QLabel):
                     except Exception as e:
                         print(f"Error during temporary paint: {e}")
 
-        if self._selected and self._pm_rect.isValid():
-            rect_to_draw = self._pm_rect
-            if self._mode == 'zoom' and self._pil_base:
-                rect_to_draw = QRect(self._top_left, QSize(int(self._pil_base.width * self._zoom), int(self._pil_base.height * self._zoom)))
-
-            pen = QPen(QColor("#4CEF50")); pen.setWidth(6); painter.setPen(pen)
-            painter.drawRect(rect_to_draw.adjusted(3, 3, -3, -3))
 
         self._draw_overlays(painter)
         self._draw_histogram_overlay(painter)
@@ -789,7 +1018,7 @@ class ImageView(QLabel):
             painter.fillRect(self.rect(), QColor(0, 0, 0, 120))
             painter.setPen(Qt.white); f = painter.font(); f.setPointSize(f.pointSize()+6); f.setBold(True); painter.setFont(f)
             painter.drawText(self.rect(), Qt.AlignCenter, "Loading…")
-            
+               
     def _draw_overlays(self, painter: QPainter):
         src = self._pick_src_pil()
         if src is None:
@@ -890,8 +1119,15 @@ class ImageView(QLabel):
         s_old = self._zoom
         T_old = self._top_left
 
-        u_img_x = (c.x() - T_old.x()) / s_old
-        u_img_y = (c.y() - T_old.y()) / s_old
+        if self._pil_base is None or s_old is None or abs(float(s_old)) < 1e-9:
+            return
+
+        denom = float(s_old)
+        if abs(denom) < 1e-6:
+            denom = 1e-6 if denom >= 0 else -1e-6
+
+        u_img_x = (c.x() - T_old.x()) / denom
+        u_img_y = (c.y() - T_old.y()) / denom
         self._zoom = new_zoom
         T_new_x = int(c.x() - u_img_x * self._zoom)
         T_new_y = int(c.y() - u_img_y * self._zoom)
@@ -937,8 +1173,15 @@ class ImageView(QLabel):
             factor = 1.25 ** step_unit
             s_old = self._zoom
             T_old = self._top_left
-            u_img_x = (c.x() - T_old.x()) / s_old
-            u_img_y = (c.y() - T_old.y()) / s_old
+            if self._pil_base is None or s_old is None or abs(float(s_old)) < 1e-9:
+                continue
+
+            denom = float(s_old)
+            if abs(denom) < 1e-6:
+                denom = 1e-6 if denom >= 0 else -1e-6
+
+            u_img_x = (c.x() - T_old.x()) / denom
+            u_img_y = (c.y() - T_old.y()) / denom
             self._zoom = min(12.0, max(0.05, self._zoom * factor))
             T_new_x = int(c.x() - u_img_x * self._zoom)
             T_new_y = int(c.y() - u_img_y * self._zoom)
@@ -993,7 +1236,6 @@ class Filmstrip(QWidget):
             return
         margin = 8
         h = self.height() - margin*2
-        # 모든 썸네일 컨테이너를 3:2 비율로 고정
         w = int(h * 1.5)
 
         thumbs: List[Optional[QPixmap]] = []
@@ -1001,7 +1243,6 @@ class Filmstrip(QWidget):
             pm = self.loader(it['path'], h)
             thumbs.append(pm)
 
-        # 모든 너비를 계산된 3:2 너비로 설정
         widths = [w] * len(self.items)
 
         cur_idx = next((i for i, it in enumerate(self.items) if it.get('current')), 0)
@@ -1032,22 +1273,17 @@ class Filmstrip(QWidget):
             x_right = r.right() + 1 + margin
 
     def _draw_thumb(self, p: QPainter, r: QRect, pm: Optional[QPixmap], it: Dict):
-        # 3:2 비율의 컨테이너를 배경보다 약간 밝은 회색(#222222)으로 채웁니다.
         p.fillRect(r, QColor("#222222"))
 
         if pm is not None and not pm.isNull():
-            # 이미지의 원래 비율을 유지하면서 3:2 컨테이너 안에 맞도록 크기를 계산합니다.
             scaled_size = pm.size().scaled(r.size(), Qt.KeepAspectRatio)
             
-            # 컨테이너(r)의 중앙에 이미지를 위치시킬 좌표를 계산합니다.
             x = r.x() + (r.width() - scaled_size.width()) / 2
             y = r.y() + (r.height() - scaled_size.height()) / 2
             target_rect = QRect(int(x), int(y), scaled_size.width(), scaled_size.height())
             
-            # 계산된 위치에 이미지를 그립니다.
             p.drawPixmap(target_rect, pm, pm.rect())
         
-        # 오버레이(별점, 색상 라벨, 선택 테두리 등)는 전체 3:2 컨테이너를 기준으로 그립니다.
         self._draw_rating(p, r, it.get('rating', 0))
         
         labelBorderColor = QColor("#1e1e1e")
@@ -1069,28 +1305,21 @@ class Filmstrip(QWidget):
             return
         color = self.COLOR_LABEL_MAP[label]
         
-        # 1. size를 썸네일 높이의 1/3로 설정 (정수 나눗셈 // 사용)
         size = r.height() // 3 
 
-        # Define the three points for the top-left corner triangle
         p1 = QPoint(r.left(), r.top())
         p2 = QPoint(r.left() + size, r.top())
         p3 = QPoint(r.left(), r.top() + size)
         triangle = QPolygon([p1, p2, p3])
 
-        # Save painter state to not affect other drawings
         p.save()
-        p.setRenderHint(QPainter.Antialiasing) # For a smooth diagonal edge
+        p.setRenderHint(QPainter.Antialiasing) 
         
-        # 2. 삼각형 내부 채우기 (외곽선 없이)
         p.setBrush(color)
-        p.setPen(Qt.NoPen) # No outline for the filled triangle
+        p.setPen(Qt.NoPen) 
         p.drawPolygon(triangle)
 
-        # 3. 대각선 경계선 그리기
-        # 검은색 펜 설정 (두께를 조절하고 싶으면 QPen(Qt.black, 2) 처럼 사용 가능)
         p.setPen(QPen(borderColor,borderWidth)) 
-        # p2에서 p3까지 선 그리기 (이것이 대각선입니다)
         p.drawLine(p2, p3)
         
         p.restore()
@@ -1100,61 +1329,46 @@ class Filmstrip(QWidget):
             return
 
         star_str_full = "★" * rating + "☆" * (5 - rating)
-        available_width = r.width() - 4  # Small horizontal margin
+        available_width = r.width() - 4  
 
-        # --- Dynamic Font Sizing Logic ---
         font = p.font()
-        font_size = 12  # Start with a default size
-        while font_size > 6:  # Minimum practical font size
+        font_size = 12  
+        while font_size > 6:  
             font.setPointSize(font_size)
             p.setFont(font)
             fm = p.fontMetrics()
             text_width = fm.horizontalAdvance(star_str_full)
             if text_width <= available_width:
-                break  # This font size fits, so we use it
+                break  
             font_size -= 1
-        # --- End of Dynamic Sizing ---
 
-        # The painter's font is now set to the optimal size
         fm = p.fontMetrics()
         
-        # Draw filled stars
         filled_str = "★" * rating
         filled_width = fm.horizontalAdvance(filled_str)
         
-        # Draw empty stars
         empty_str = "☆" * (5 - rating)
         
         total_width = fm.horizontalAdvance(filled_str + empty_str)
         
-        # Calculate the starting X position to center the entire string
         start_x = r.left() + (r.width() - total_width) // 2
-        # Vertically align text to the bottom of the thumbnail
         text_rect = QRect(start_x, r.bottom() - fm.height() - 2, total_width, fm.height())
 
-        # --- 수정된 부분: 검은색 테두리가 있는 노란색 별 그리기 ---
         if filled_str:
-            # 1. 채워진 별에 대한 QPainterPath 생성
             path = QPainterPath()
-            # 폰트 메트릭스를 사용하여 텍스트의 기준선을 정렬합니다.
             path.addText(text_rect.left(), text_rect.top() + fm.ascent(), font, filled_str)
 
-            # 2. 검은색 테두리 그리기 (stroke)
-            # 테두리 두께(이 예제에서는 1)는 필요에 따라 조절할 수 있습니다.
             pen = QPen(QColor("black"), 1)
             p.setPen(pen)
-            p.setBrush(Qt.NoBrush) # 내부는 채우지 않음
+            p.setBrush(Qt.NoBrush) 
             p.drawPath(path)
 
-            # 3. 금색으로 내부 채우기 (fill)
             brush = QBrush(QColor("#FFD700"))
             p.setBrush(brush)
-            p.setPen(Qt.NoPen) # 채울 때는 테두리를 그리지 않음
+            p.setPen(Qt.NoPen) 
             p.drawPath(path)
             p.setBrush(Qt.NoBrush)
-        # --- 수정 종료 ---
 
-        # 기존과 동일: 회색 별 그리기
         empty_rect = QRect(text_rect.left() + filled_width, text_rect.top(), text_rect.width() - filled_width, text_rect.height())
         p.setPen(QColor("#808080"))
         p.drawText(empty_rect, Qt.AlignLeft | Qt.AlignVCenter, empty_str)
@@ -1170,6 +1384,9 @@ class LoaderSignals(QObject):
     loaded = Signal(str, str)
     meta = Signal(str, dict)
     xmp = Signal(str, dict)
+    load_failed = Signal(str, str)
+    xmp_saved = Signal(str)
+    xmp_save_failed = Signal(str)
     thumb_ready = Signal(str, int, object)
     resized_pixmap_ready = Signal(str, QSize, object)
 
@@ -1244,13 +1461,21 @@ class CullingWidget(QWidget):
         self.cache_full_limit = 32
         self.cache_half_limit = 64
         self.cache_lock = threading.Lock()
+        self._cache_estimated_bytes: int = 0
+        self._cache_item_sizes: Dict[Tuple[str, str], int] = {}
+        self._cache_usage_order: OrderedDict[Tuple[str, str], int] = OrderedDict()
+        self._cache_memory_target: int = self._compute_cache_memory_target()
         self._pm_thumb_cache: Dict[Tuple[str,int], QPixmap] = {}
         self._pm_thumb_limit = 256
+        self._load_failures: set[str] = set()
 
         self.signals = LoaderSignals()
         self.signals.loaded.connect(self._on_loaded)
         self.signals.meta.connect(self._on_meta_ready)
         self.signals.xmp.connect(self._on_xmp_ready)
+        self.signals.load_failed.connect(self._on_load_failed)
+        self.signals.xmp_saved.connect(self._on_xmp_saved)
+        self.signals.xmp_save_failed.connect(self._on_xmp_save_failed)
         self.signals.thumb_ready.connect(self._on_thumb_ready)
         self.signals.resized_pixmap_ready.connect(self._on_resized_pixmap_ready)
 
@@ -1268,12 +1493,11 @@ class CullingWidget(QWidget):
         self._full_running = 0
 
         self.selections_path = os.path.join(root, 'selections.json')
-        self._load_selections() # Kept for legacy compatibility, but XMP is now primary
+        self._load_selections() 
 
         self.autosave_timer = QTimer(self); self.autosave_timer.setSingleShot(True)
         self.autosave_interval_timer = QTimer(self)
         self.update_autosave_interval()
-        # --- MODIFIED ---
         self.autosave_timer.timeout.connect(self.save_all_dirty_files)
         self.autosave_interval_timer.timeout.connect(self.save_all_dirty_files)
         self.autosave_interval_timer.start()
@@ -1281,7 +1505,6 @@ class CullingWidget(QWidget):
         self._pending_tasks = set()
         self._pending_lock = threading.Lock()
 
-        self._load_all_xmp_data()
 
         self._schedule_timer = QTimer(self); self._schedule_timer.setSingleShot(True)
         self._schedule_timer.setInterval(80); self._schedule_timer.timeout.connect(self._schedule_loading_plan_fire)
@@ -1376,7 +1599,7 @@ class CullingWidget(QWidget):
     def _create_actions(self):
         self.actions: Dict[str, QAction] = {}
         action_map = {
-            'save': self.save_all_dirty_files, # MODIFIED
+            'save': self.save_all_dirty_files, 
             'quit': self.window().close,
             'next': self.next_photo,
             'prev': self.prev_photo,
@@ -1408,7 +1631,6 @@ class CullingWidget(QWidget):
             if self._hdr_toggle_key is not None and key == self._hdr_toggle_key:
                 self.toggle_hdr(); return True
             
-            # Handle XMP shortcuts
             if Qt.Key_1 <= key <= Qt.Key_5:
                 self.set_rating(key - Qt.Key_0)
                 return True
@@ -1478,16 +1700,105 @@ class CullingWidget(QWidget):
         while len(od) > limit:
             od.popitem(last=False)
 
+    def _compute_cache_memory_target(self) -> int:
+        min_budget = 128 * 1024 * 1024
+        max_budget = 1024 * 1024 * 1024
+        if psutil is not None:
+            try:
+                vm = psutil.virtual_memory()
+                total = getattr(vm, 'total', 0) or 0
+                available = getattr(vm, 'available', 0) or 0
+                if total > 0 and available > 0:
+                    calculated = int(min(total * 0.15, available * 0.5))
+                    return max(min_budget, min(max_budget, calculated))
+            except Exception:
+                pass
+        return 512 * 1024 * 1024
+
+    def _enforce_cache_limits_locked(self, kind: str, limit: int):
+        cache = self.pil_full_cache if kind == 'full' else self.pil_half_cache
+        while len(cache) > limit:
+            key, pil = cache.popitem(last=False)
+            removed_size = self._cache_item_sizes.pop((kind, key), None)
+            if removed_size is None:
+                removed_size = _estimate_pil_bytes(pil)
+            self._cache_estimated_bytes = max(0, self._cache_estimated_bytes - (removed_size or 0))
+            self._cache_usage_order.pop((kind, key), None)
+        self._enforce_memory_budget_locked()
+
+    def _enforce_memory_budget_locked(self):
+        self._cache_memory_target = self._compute_cache_memory_target()
+        target = self._cache_memory_target
+        if target <= 0:
+            return
+
+        while self._cache_estimated_bytes > target and self._cache_usage_order:
+            (kind, key), _ = self._cache_usage_order.popitem(last=False)
+            cache = self.pil_full_cache if kind == 'full' else self.pil_half_cache
+            pil = cache.pop(key, None)
+            removed_size = self._cache_item_sizes.pop((kind, key), None)
+            if removed_size is None and pil is not None:
+                removed_size = _estimate_pil_bytes(pil)
+            if removed_size is None:
+                removed_size = 0
+            self._cache_estimated_bytes = max(0, self._cache_estimated_bytes - removed_size)
+
     def _get_pil_full_cached(self, path: str) -> Optional[Image.Image]:
-        with self.cache_lock: return self.pil_full_cache.get(path)
+        with self.cache_lock:
+            pil = self.pil_full_cache.get(path)
+            if pil is not None:
+                size = self._cache_item_sizes.get(('full', path))
+                if size is None:
+                    size = _estimate_pil_bytes(pil)
+                self._cache_usage_order.pop(('full', path), None)
+                self._cache_usage_order[('full', path)] = size
+            return pil
     def _get_pil_half_cached(self, path: str) -> Optional[Image.Image]:
-        with self.cache_lock: return self.pil_half_cache.get(path)
+        with self.cache_lock:
+            pil = self.pil_half_cache.get(path)
+            if pil is not None:
+                size = self._cache_item_sizes.get(('half', path))
+                if size is None:
+                    size = _estimate_pil_bytes(pil)
+                self._cache_usage_order.pop(('half', path), None)
+                self._cache_usage_order[('half', path)] = size
+            return pil
     def _put_pil_full(self, path: str, pil: Image.Image):
+        if pil is None:
+            return
+        size = _estimate_pil_bytes(pil)
         with self.cache_lock:
-            self.pil_full_cache[path] = pil; self._touch(self.pil_full_cache, path, self.cache_full_limit)
+            prev = self.pil_full_cache.pop(path, None)
+            if prev is not None:
+                prev_size = self._cache_item_sizes.pop(('full', path), None)
+                if prev_size is not None:
+                    self._cache_estimated_bytes = max(0, self._cache_estimated_bytes - prev_size)
+                else:
+                    self._cache_estimated_bytes = max(0, self._cache_estimated_bytes - _estimate_pil_bytes(prev))
+                self._cache_usage_order.pop(('full', path), None)
+            self.pil_full_cache[path] = pil
+            self._cache_item_sizes[('full', path)] = size
+            self._cache_estimated_bytes += size
+            self._cache_usage_order[('full', path)] = size
+            self._enforce_cache_limits_locked('full', self.cache_full_limit)
     def _put_pil_half(self, path: str, pil: Image.Image):
+        if pil is None:
+            return
+        size = _estimate_pil_bytes(pil)
         with self.cache_lock:
-            self.pil_half_cache[path] = pil; self._touch(self.pil_half_cache, path, self.cache_half_limit)
+            prev = self.pil_half_cache.pop(path, None)
+            if prev is not None:
+                prev_size = self._cache_item_sizes.pop(('half', path), None)
+                if prev_size is not None:
+                    self._cache_estimated_bytes = max(0, self._cache_estimated_bytes - prev_size)
+                else:
+                    self._cache_estimated_bytes = max(0, self._cache_estimated_bytes - _estimate_pil_bytes(prev))
+                self._cache_usage_order.pop(('half', path), None)
+            self.pil_half_cache[path] = pil
+            self._cache_item_sizes[('half', path)] = size
+            self._cache_estimated_bytes += size
+            self._cache_usage_order[('half', path)] = size
+            self._enforce_cache_limits_locked('half', self.cache_half_limit)
     def _put_resized_pixmap(self, path: str, size: QSize, pixmap: QPixmap):
         key = (path, size.width(), size.height())
         with self.cache_lock:
@@ -1522,13 +1833,21 @@ class CullingWidget(QWidget):
         if kind == 'half':
             with _ptime(f"worker half postprocess {os.path.basename(path)}", warn_ms=40):
                 pil = load_half_pil(path)
-            self._put_pil_half(path, pil); self.signals.loaded.emit(path, 'half')
+            if pil is None:
+                self.signals.load_failed.emit(path, 'half')
+            else:
+                self._put_pil_half(path, pil)
+            self.signals.loaded.emit(path, 'half')
         elif kind == 'full':
             self._acquire_full_slot()
             try:
                 with _ptime(f"worker full postprocess {os.path.basename(path)}", warn_ms=80):
                     pil = load_full_pil(path)
-                self._put_pil_full(path, pil); self.signals.loaded.emit(path, 'full')
+                if pil is None:
+                    self.signals.load_failed.emit(path, 'full')
+                else:
+                    self._put_pil_full(path, pil)
+                self.signals.loaded.emit(path, 'full')
             finally:
                 self._release_full_slot()
         elif kind == 'meta':
@@ -1683,30 +2002,25 @@ class CullingWidget(QWidget):
         if self.idx > 0:
             self.idx -= 1; self._show_current(); self._heavy_load_scheduler.start()
 
-    # --- NEW ---
     def _load_xmp_if_needed(self, photo: Photo):
         """Photo 객체의 XMP 데이터를 아직 읽지 않았다면 파일에서 읽기 작업을 예약합니다."""
-        if photo.xmp_loaded:
-            return
-        
-        # xmp_loaded 플래그를 즉시 True로 설정하여 중복 요청 방지
-        photo.xmp_loaded = True
-        # 백그라운드에서 XMP 읽기 요청
+        with photo.lock:
+            if photo.xmp_loaded:
+                return
+            photo.xmp_loaded = True
         self._enqueue_xmp(photo.path, priority=-95)
 
-    # --- MODIFIED ---
     def toggle_select(self):
         p = self._current()
         if not p: return
         
-        self._load_xmp_if_needed(p) # XMP가 로드되었는지 확인
-        p.update_xmp({'selected': not p.selected}) # 메모리 상태만 변경
+        self._load_xmp_if_needed(p) 
+        p.update_xmp({'selected': not p.selected}) 
         
         self._update_selected_badge_fast()
-        self._show_current() # UI 갱신
-        self.autosave_timer.start(1500) # 짧은 시간 후 자동 저장 트리거
+        self._show_current() 
+        self.autosave_timer.start(1500) 
 
-    # --- MODIFIED ---
     def unselect_current(self):
         p = self._current()
         if not p: return
@@ -1718,7 +2032,6 @@ class CullingWidget(QWidget):
             self._show_current()
             self.autosave_timer.start(1500)
 
-    # --- MODIFIED ---
     def set_rating(self, rating: int):
         p = self._current()
         if not p or not (0 <= rating <= 5): return
@@ -1732,7 +2045,6 @@ class CullingWidget(QWidget):
         self._update_filmstrip()
         self.autosave_timer.start(1500)
 
-    # --- MODIFIED ---
     def set_color_label(self, label: Optional[str]):
         p = self._current()
         if not p: return
@@ -1766,10 +2078,17 @@ class CullingWidget(QWidget):
         self.status_restore_timer.stop()
         self.status_message.emit(message, 0)
         self.status_restore_timer.start(timeout)
+        
+    def _show_toast(self, text: str, ms: int = 1500):
+        window = self.window() or self.parent()
+        show_toast = getattr(window, "_show_toast", None) if window else None
+        if callable(show_toast):
+            show_toast(text, ms)
+        else:
+            self.status_message.emit(text, ms)
 
-    # --- MODIFIED ---
     def export_selected(self):
-        self.save_all_dirty_files() # 내보내기 전 모든 변경사항을 파일에 저장
+        self.save_all_dirty_files() 
         self.export_requested.emit()
 
     def _on_filmstrip_click(self, path: str):
@@ -1837,42 +2156,54 @@ class CullingWidget(QWidget):
         if not photo:
             return
 
-        # --- MODIFIED ---
-        # 핵심 로직 강화:
-        # 사용자가 데이터를 수정했거나(is_dirty), 
-        # 혹은 파일에 저장하는 작업이 진행 중일 때(is_saving)는
-        # 파일에서 읽어온 낡은 데이터로 절대 덮어쓰지 않습니다.
-        if photo.is_dirty or photo.is_saving:
-            return
+        def _safe_int(value, default=0):
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                return default
 
-        # 사용자가 수정하지 않은 경우에만 파일에서 읽어온 데이터로 메모리를 업데이트합니다.
-        has_changed = False
-        new_rating = data.get('rating', 0)
-        if photo.rating != new_rating:
-            photo.rating = new_rating
-            has_changed = True
+        with photo.lock:
+            photo.xmp_loaded = True
+            if photo.is_dirty or photo.is_saving:
+                return
 
-        new_label = data.get('color_label', '')
-        if photo.color_label != new_label:
-            photo.color_label = new_label
-            has_changed = True
+            raw_rating = data.get('rating')
+            raw_label = data.get('color_label')
+            raw_selected = data.get('selected')
 
-        new_selected = data.get('selected', photo.selected)
-        if photo.selected != new_selected:
-            photo.selected = new_selected
-            has_changed = True
-
-        if has_changed:
-            cur = self._current()
-            # UI 업데이트는 현재 보고 있는 사진일 경우에만 수행
-            if cur and cur.path == path:
-                self.view.set_selected(photo.selected)
-                self._update_filmstrip()
+            rating_val = None if raw_rating is None else _safe_int(raw_rating, photo.rating)
+            label_val = raw_label if raw_label is not None else None
+            if raw_selected is None:
+                selected_val = None
+            elif isinstance(raw_selected, bool):
+                selected_val = raw_selected
             else:
-                # 현재 화면이 아닌 경우 필름 스트립만 업데이트해도 충분
-                self.filmstrip.update()
-            
-            self._update_selected_badge_fast()
+                selected_val = bool(_safe_int(raw_selected, 1 if photo.selected else 0))
+
+            rating_changed = rating_val is not None and photo.rating != rating_val
+            label_changed = label_val is not None and photo.color_label != label_val
+            selected_changed = selected_val is not None and photo.selected != selected_val
+
+            if rating_changed:
+                photo.rating = rating_val
+            if label_changed:
+                photo.color_label = label_val
+            if selected_changed:
+                photo.selected = selected_val
+
+            if not (rating_changed or label_changed or selected_changed):
+                return
+
+            current_selected = photo.selected
+
+        cur = self._current()
+        if cur and cur.path == path:
+            self.view.set_selected(current_selected)
+            self._update_filmstrip()
+        else:
+            self.filmstrip.update()
+
+        self._update_selected_badge_fast()
         
     def _refresh_statusbar(self):
         if self.status_restore_timer.isActive(): return
@@ -1884,15 +2215,21 @@ class CullingWidget(QWidget):
         msg = f"[{self.idx+1}/{total}]  Selected: {total_sel}  {os.path.basename(p.path)}  |  workers: {self._num_workers}"
         self.status_message.emit(msg, 0)
 
-    # --- MODIFIED ---
     def _show_current(self):
         p = self._current()
         if not p:
             self.meta_left.setText("")
             self.view.setText("No images"); return
 
-        self._load_xmp_if_needed(p) # --- ADDED ---
+        self._load_xmp_if_needed(p) 
 
+        total = len(self.catalog.photos)
+        visible_range = range(max(0, self.idx - 5), min(total, self.idx + 6))  
+        for i in visible_range:
+            if i<0: break
+            visiblePhoto = self.catalog.photos[i]
+            self._load_xmp_if_needed(visiblePhoto)
+        
         self.view.set_selected(p.selected)
         self._update_metadata(p.path)
         self._refresh_statusbar()
@@ -1925,6 +2262,8 @@ class CullingWidget(QWidget):
     @Slot(str, str)
     def _on_loaded(self, path: str, kind: str):
         _plog(f"[SLOT] _on_loaded received for path={os.path.basename(path)}, kind={kind}")
+        if self._get_pil_full_cached(path) or self._get_pil_half_cached(path):
+            self._load_failures.discard(path)
         cur = self._current(); is_current = (cur and cur.path == path)
         if is_current:
             self.view.set_pils(self._get_pil_full_cached(path), self._get_pil_half_cached(path))
@@ -1938,6 +2277,29 @@ class CullingWidget(QWidget):
             else: self.view.update()
             self._update_metadata(path)
         self._refresh_statusbar(); self.filmstrip.update()
+
+    @Slot(str, str)
+    def _on_load_failed(self, path: str, kind: str):
+        cur = self._current()
+        if cur and cur.path == path:
+            self.view.set_loading(False)
+        if path in self._load_failures:
+            return
+        self._load_failures.add(path)
+        self._show_toast(f"Failed to load image: {os.path.basename(path)}", 2000)
+
+    @Slot(str)
+    def _on_xmp_saved(self, path: str):
+        self._refresh_statusbar()
+        cur = self._current()
+        if cur and cur.path == path:
+            self._update_metadata(path)
+        self.status_message.emit(f"Metadata saved for {os.path.basename(path)}", 2000)
+
+    @Slot(str)
+    def _on_xmp_save_failed(self, path: str):
+        self.status_message.emit(f"Failed to save metadata for {os.path.basename(path)}", 3000)
+        self._show_toast(f"Failed to save metadata: {os.path.basename(path)}", 2000)
 
     @Slot(str, QSize, object)
     def _on_resized_pixmap_ready(self, path: str, size: QSize, qimg_obj):
@@ -2058,17 +2420,14 @@ class CullingWidget(QWidget):
                 data = json.load(f)
             selected_set = set(data.get('selected_paths', []))
             for p in self.catalog.photos:
-                # XMP 'selected' status will override this later if it exists
                 p.selected = (p.path in selected_set)
         except Exception:
             pass
 
-    # --- NEW (replaces save_selections and _mark_dirty_and_autosave) ---
     def save_all_dirty_files(self):
         """메모리에서 변경된 모든 사항(selections.json 및 XMP)을 파일에 저장합니다."""
         self.autosave_timer.stop()
 
-        # 1. selections.json 저장은 기존과 동일
         selected_paths = [p.path for p in self.catalog.photos if p.selected]
         data = {'root': self.catalog.root, 'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'selected_paths': selected_paths}
@@ -2078,40 +2437,77 @@ class CullingWidget(QWidget):
         except Exception as e:
             print(f"Error saving selections.json: {e}")
 
-        # 2. 변경된 XMP 파일들 저장 로직 수정
-        dirty_photos = [p for p in self.catalog.photos if p.is_dirty]
-        if not dirty_photos:
+        tasks: List[Tuple[Photo, Dict, int]] = []
+        for photo in self.catalog.photos:
+            with photo.lock:
+                if not photo.is_dirty or photo.is_saving:
+                    continue
+                data_to_write = {
+                    'rating': photo.rating,
+                    'color_label': photo.color_label,
+                    'selected': photo.selected
+                }
+                version = photo.version
+                photo.is_dirty = False
+                photo.is_saving = True
+                photo.saving_version = version
+            tasks.append((photo, data_to_write, version))
+
+        if not tasks:
             return
 
-        for photo in dirty_photos:
-            data_to_write = {
-                'rating': photo.rating,
-                'color_label': photo.color_label,
-                'selected': photo.selected
-            }
+        def _write_task_with_cleanup(path, data, photo_obj, version):
+            success = False
+            try:
+                success = bool(write_xmp_sidecar(path, data))
+            except Exception as e:
+                print(f"Unexpected error saving XMP for {os.path.basename(path)}: {e}")
+                success = False
 
-            # --- NEW ---
-            # 백그라운드 작업 완료 후 Photo 객체의 상태를 업데이트할 함수를 정의합니다.
-            # 이 함수는 백그라운드 스레드에서 직접 Photo 객체를 수정합니다.
-            # (단순 플래그 변경이라 스레드 충돌 위험이 거의 없어 안전합니다.)
-            def _write_task_with_cleanup(path, data, photo_obj):
-                try:
-                    write_xmp_sidecar(path, data)
-                finally:
-                    # 파일 쓰기가 성공하든 실패하든, '저장 중' 상태는 해제합니다.
-                    photo_obj.is_saving = False
+            should_retry = False
+            signal_to_emit = None
+            with photo_obj.lock:
+                if photo_obj.saving_version != version:
+                    return success, should_retry
+                photo_obj.is_saving = False
+                if photo_obj.version > version:
+                    photo_obj.is_dirty = True
+                    photo_obj.saving_version = version
+                    return success, should_retry
+                if not success:
+                    photo_obj.is_dirty = True
+                    photo_obj.saving_version = version
+                    should_retry = True
+                    signal_to_emit = 'failed'
+                else:
+                    photo_obj.saving_version = version
+                    signal_to_emit = 'saved'
 
-            # 백그라운드 워커에게 쓰기 작업과 정리 작업을 포함한 래퍼 함수를 전달합니다.
-            self._post_task(20, _write_task_with_cleanup, photo.path, data_to_write, photo)
-            
-            # Photo의 상태를 'dirty'에서 'saving'으로 전환합니다.
-            photo.is_dirty = False
-            photo.is_saving = True
+            if signal_to_emit == 'saved':
+                self.signals.xmp_saved.emit(path)
+            elif signal_to_emit == 'failed':
+                self.signals.xmp_save_failed.emit(path)
 
-        self._show_temporary_status(f"Auto-saved metadata for {len(dirty_photos)} photos.", 2000)
-    # --- MODIFIED ---
+            return success, should_retry
+
+        def _queue_write(path, data, photo_obj, version):
+            _, should_retry = _write_task_with_cleanup(path, data, photo_obj, version)
+            if not should_retry:
+                return
+
+            with photo_obj.lock:
+                if photo_obj.saving_version != version or not photo_obj.is_dirty or photo_obj.is_saving:
+                    return
+                photo_obj.is_saving = True
+
+            self._post_task(10, _queue_write, path, data, photo_obj, version)
+
+        for photo, payload, version in tasks:
+            self._post_task(20, _queue_write, photo.path, payload, photo, version)
+
+        self._show_temporary_status(f"Auto-saved metadata for {len(tasks)} photos.", 2000)
     def cleanup(self):
-        self.save_all_dirty_files() # 위젯 정리 전 모든 변경사항을 파일에 저장
+        self.save_all_dirty_files() 
         self._loader_stop = True
         try:
             while True:
@@ -2637,7 +3033,7 @@ class AppWindow(QMainWindow):
             return 0, "", 0, "", 0, 0, 0
 
         cw = self.culling_widget
-        cw.save_all_dirty_files() # MODIFIED
+        cw.save_all_dirty_files() 
 
         selected_raw_paths = [p.path for p in cw.catalog.photos if p.selected]
         selected_count = len(selected_raw_paths)
@@ -2668,7 +3064,6 @@ class AppWindow(QMainWindow):
                 if _needs_copy(src_path, dst_path):
                     shutil.copy2(src_path, dst_path)
                     copied_raw += 1
-                # Also copy XMP sidecar if it exists
                 src_xmp = os.path.splitext(src_path)[0] + '.xmp'
                 dst_xmp = os.path.splitext(dst_path)[0] + '.xmp'
                 if os.path.exists(src_xmp) and _needs_copy(src_xmp, dst_xmp):
@@ -2760,7 +3155,6 @@ class AppWindow(QMainWindow):
         
     def closeEvent(self, event):
         if self.culling_widget:
-            # The cleanup method now handles saving all dirty files.
             self.culling_widget.cleanup()
         event.accept()
 
