@@ -24,7 +24,7 @@ from PySide6.QtGui import QPixmap, QKeySequence, QAction, QPainter, QPen, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QMessageBox, QFrame,
     QStatusBar, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStackedWidget,
-    QToolBar, QDialog, QFormLayout, QSpinBox, QLineEdit, QDialogButtonBox,
+    QToolBar, QDialog, QFormLayout, QGridLayout, QSpinBox, QLineEdit, QDialogButtonBox,
     QSizePolicy, QGroupBox, QGraphicsDropShadowEffect, QRadioButton, QSpacerItem,
     QProgressDialog
 )
@@ -55,6 +55,29 @@ def _ptime(label: str, warn_ms: float = 16.0):
 SUPPORTED_EXTS = {
     '.cr3', '.cr2', '.nef', '.arw', '.raf', '.dng', '.orf', '.rw2', '.srw', '.pef'
 }
+
+DEFAULT_HOTKEYS = OrderedDict([
+    ('next', 'D, Right'),
+    ('prev', 'A, Left'),
+    ('toggle_select', 'Space, S'),
+    ('unselect', 'X'),
+    ('toggle_zebra', 'Q'),
+    ('toggle_hdr', 'E'),
+    ('rate_1', '1'),
+    ('rate_2', '2'),
+    ('rate_3', '3'),
+    ('rate_4', '4'),
+    ('rate_5', '5'),
+    ('label_red', '6'),
+    ('label_yellow', '7'),
+    ('label_green', '8'),
+    ('label_blue', '9'),
+    ('label_purple', '0'),
+    ('save', ''),
+    ('export', 'Ctrl+S'),
+    ('help', 'F1'),
+    ('quit', 'Esc'),
+])
 
 _XMP_GLOBAL_LOCK = threading.Lock()
 def read_xmp_sidecar(path: str) -> Dict:
@@ -1229,18 +1252,16 @@ class AppSettings:
     output_folder_name: str = "selected"
     raw_output_folder_name: str = "_selected_raw"
     jpeg_output_folder_name: str = "_selected_jpeg"
-    hotkeys: Dict[str, str] = field(default_factory=lambda: {
-        'next': 'D, Right',
-        'prev': 'A, Left',
-        'toggle_select': 'Space, S',
-        'unselect': 'X',
-        'toggle_zebra': 'Q',
-        'toggle_hdr': 'E',
-        'save': '',
-        'export': 'Ctrl+S',
-        'help': 'F1',
-        'quit': 'Esc'
-    })
+    hotkeys: Dict[str, str] = field(default_factory=lambda: OrderedDict(DEFAULT_HOTKEYS))
+
+    def __post_init__(self):
+        ordered = OrderedDict()
+        for key, default_value in DEFAULT_HOTKEYS.items():
+            ordered[key] = self.hotkeys.get(key, default_value)
+        for key, value in self.hotkeys.items():
+            if key not in ordered:
+                ordered[key] = value
+        self.hotkeys = ordered
 
 class CullingWidget(QWidget):
     status_message = Signal(str, int)
@@ -1352,8 +1373,7 @@ class CullingWidget(QWidget):
 
         self.zebra_toggled = False
         self.hdr_toggled = False
-        self._zebra_toggle_key: Optional[Qt.Key] = None
-        self._hdr_toggle_key: Optional[Qt.Key] = None
+        self._hotkey_bindings: Dict[str, List[QAction]] = {}
 
         self.status_restore_timer = QTimer(self); self.status_restore_timer.setSingleShot(True)
         self.status_restore_timer.timeout.connect(self._refresh_statusbar)
@@ -1410,19 +1430,7 @@ class CullingWidget(QWidget):
     def update_settings(self):
         self.update_autosave_interval()
         self._apply_hotkeys()
-        self._update_toggle_keys()
-
-    def _update_toggle_keys(self):
-        try:
-            zebra_key_str = self.settings.hotkeys.get('toggle_zebra', '').split(',')[0].strip()
-            self._zebra_toggle_key = QKeySequence(zebra_key_str)[0].key() if zebra_key_str else None
-        except Exception:
-            self._zebra_toggle_key = None
-        try:
-            hdr_key_str = self.settings.hotkeys.get('toggle_hdr', '').split(',')[0].strip()
-            self._hdr_toggle_key = QKeySequence(hdr_key_str)[0].key() if hdr_key_str else None
-        except Exception:
-            self._hdr_toggle_key = None
+        self._rebuild_hotkey_bindings()
 
     def update_autosave_interval(self):
         self.autosave_interval_timer.setInterval(self.settings.autosave_interval_min * 60 * 1000)
@@ -1430,18 +1438,40 @@ class CullingWidget(QWidget):
     def _create_actions(self):
         self.actions: Dict[str, QAction] = {}
         action_map = {
-            'save': self.save_all_dirty_files, 
+            'save': self.save_all_dirty_files,
             'quit': self.window().close,
             'next': self.next_photo,
             'prev': self.prev_photo,
             'toggle_select': self.toggle_select,
             'unselect': self.unselect_current,
             'export': self.export_selected,
-            'help': self.show_help
+            'help': self.show_help,
+            'toggle_zebra': self.toggle_zebra,
+            'toggle_hdr': self.toggle_hdr,
         }
         for name, callback in action_map.items():
             action = QAction(self)
             action.triggered.connect(callback)
+            self.actions[name] = action
+            self.addAction(action)
+
+        for rating in range(1, 6):
+            action = QAction(self)
+            action.triggered.connect(lambda checked=False, r=rating: self.set_rating(r))
+            name = f'rate_{rating}'
+            self.actions[name] = action
+            self.addAction(action)
+
+        color_map = {
+            'label_red': 'Red',
+            'label_yellow': 'Yellow',
+            'label_green': 'Green',
+            'label_blue': 'Blue',
+            'label_purple': 'Purple',
+        }
+        for name, label in color_map.items():
+            action = QAction(self)
+            action.triggered.connect(lambda checked=False, lbl=label: self.set_color_label(lbl))
             self.actions[name] = action
             self.addAction(action)
         self._apply_hotkeys()
@@ -1452,33 +1482,50 @@ class CullingWidget(QWidget):
                 sequences = [QKeySequence(s.strip()) for s in key_sequence_str.split(',') if s.strip()]
                 self.actions[name].setShortcuts(sequences)
 
+    def _rebuild_hotkey_bindings(self):
+        relevant_names = [
+            *(f'rate_{i}' for i in range(1, 6)),
+            'label_red', 'label_yellow', 'label_green', 'label_blue', 'label_purple',
+            'toggle_zebra', 'toggle_hdr',
+        ]
+
+        bindings: Dict[str, List[QAction]] = {}
+        for name in relevant_names:
+            action = self.actions.get(name)
+            if not action:
+                continue
+            try:
+                shortcuts = action.shortcuts()
+            except Exception:
+                shortcuts = []
+            for seq in shortcuts:
+                text = seq.toString(QKeySequence.PortableText)
+                if not text:
+                    continue
+                bindings.setdefault(text, []).append(action)
+
+        self._hotkey_bindings = bindings
+
     def eventFilter(self, obj, ev: QEvent):
         if ev.type() in (QEvent.Type.KeyPress, QEvent.Type.Wheel, QEvent.Type.MouseButtonPress):
             self._note_user_input()
         if ev.type() == QEvent.Type.KeyPress and not ev.isAutoRepeat():
-            key = ev.key()
-            if self._zebra_toggle_key is not None and key == self._zebra_toggle_key:
-                self.toggle_zebra(); return True
-            if self._hdr_toggle_key is not None and key == self._hdr_toggle_key:
-                self.toggle_hdr(); return True
-            
-            if Qt.Key_1 <= key <= Qt.Key_5:
-                self.set_rating(key - Qt.Key_0)
-                return True
-            if key == Qt.Key_6:
-                self.set_color_label("Red")
-                return True
-            if key == Qt.Key_7:
-                self.set_color_label("Yellow")
-                return True
-            if key == Qt.Key_8:
-                self.set_color_label("Green")
-                return True
-            if key == Qt.Key_9:
-                self.set_color_label("Blue")
-                return True
-            if key == Qt.Key_0:
-                self.set_color_label("Purple")
+            key_sequence = QKeySequence(ev.keyCombination())
+            portable = key_sequence.toString(QKeySequence.PortableText)
+            actions = self._hotkey_bindings.get(portable, []) if portable else []
+
+            if not actions and ev.modifiers() == Qt.NoModifier:
+                fallback = QKeySequence(ev.key())
+                portable_fallback = fallback.toString(QKeySequence.PortableText)
+                if portable_fallback and portable_fallback != portable:
+                    actions = self._hotkey_bindings.get(portable_fallback, [])
+
+            handled = False
+            for action in actions:
+                if action and action.isEnabled():
+                    action.trigger()
+                    handled = True
+            if handled:
                 return True
 
         return super().eventFilter(obj, ev)
@@ -1828,11 +1875,30 @@ class CullingWidget(QWidget):
 
     def show_help(self):
         hotkeys = self.settings.hotkeys
+        def binding_display(action: str) -> str:
+            value = (hotkeys.get(action) or '').strip()
+            if value:
+                return value
+            return 'Disabled'
+
+        rating_lines = [
+            f"{stars}★: {binding_display(f'rate_{stars}')}" for stars in range(1, 6)
+        ]
+        color_labels = [
+            ('label_red', 'Red'),
+            ('label_yellow', 'Yellow'),
+            ('label_green', 'Green'),
+            ('label_blue', 'Blue'),
+            ('label_purple', 'Purple'),
+        ]
+        color_lines = [
+            f"{label}: {binding_display(action)}" for action, label in color_labels
+        ]
+
         xmp_hotkeys = (
-            "<b>XMP/Rating:</b>\n"
-            "  1-5: Set star rating\n"
-            "  6: Red, 7: Yellow, 8: Green, 9: Blue\n"
-            "  0: Clear color label"
+            "<b>Rating & Labels:</b>\n"
+            f"  {', '.join(rating_lines)}\n"
+            f"  {', '.join(color_lines)}"
         )
         QMessageBox.information(self, "Key Bindings",
             f"Navigate: {hotkeys.get('next','')} (Next), {hotkeys.get('prev','')} (Previous)\n"
@@ -2420,7 +2486,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.settings = settings
-        self.hotkey_edits: Dict[str, QLineEdit] = {}
+        self.hotkey_edits: Dict[str, 'KeySequenceEdit'] = {}
 
         main_layout = QVBoxLayout(self)
         
@@ -2445,8 +2511,10 @@ class SettingsDialog(QDialog):
         main_layout.addWidget(general_group)
 
         hotkey_group = QGroupBox("Hotkeys")
-        hotkey_layout = QFormLayout()
-        
+        hotkey_layout = QGridLayout()
+        hotkey_layout.setHorizontalSpacing(12)
+        hotkey_layout.setVerticalSpacing(8)
+
         hotkey_labels = {
             'next': 'Next Image:',
             'prev': 'Previous Image:',
@@ -2454,17 +2522,53 @@ class SettingsDialog(QDialog):
             'unselect': 'Unselect Image:',
             'toggle_zebra': 'Toggle Zebra/Histogram:',
             'toggle_hdr': 'Toggle Faux HDR Preview:',
+            'rate_1': '1★ Rating:',
+            'rate_2': '2★ Rating:',
+            'rate_3': '3★ Rating:',
+            'rate_4': '4★ Rating:',
+            'rate_5': '5★ Rating:',
+            'label_red': 'Label Red:',
+            'label_yellow': 'Label Yellow:',
+            'label_green': 'Label Green:',
+            'label_blue': 'Label Blue:',
+            'label_purple': 'Label Purple:',
             'save': 'Save Selections:',
             'export': 'Export Selected:',
             'help': 'Show Help:',
             'quit': 'Quit Application:'
         }
 
-        for action, key_sequence_str in self.settings.hotkeys.items():
-            label_text = hotkey_labels.get(action, f"{action.replace('_', ' ').title()}:")
+        hotkey_entries = []
+        for action, default_value in DEFAULT_HOTKEYS.items():
+            key_sequence_str = self.settings.hotkeys.get(action, default_value)
+            label = QLabel(hotkey_labels.get(action, f"{action.replace('_', ' ').title()}:"))
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             edit = KeySequenceEdit(key_sequence_str)
-            hotkey_layout.addRow(label_text, edit)
+            hotkey_entries.append((action, label, edit))
+
+        for action in self.settings.hotkeys.keys():
+            if action in DEFAULT_HOTKEYS:
+                continue
+            key_sequence_str = self.settings.hotkeys.get(action, '')
+            label = QLabel(hotkey_labels.get(action, f"{action.replace('_', ' ').title()}:"))
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            edit = KeySequenceEdit(key_sequence_str)
+            hotkey_entries.append((action, label, edit))
+
+        columns = 2
+        rows_per_column = max(1, (len(hotkey_entries) + columns - 1) // columns)
+        for index, (action, label, edit) in enumerate(hotkey_entries):
+            column = index // rows_per_column
+            row = index % rows_per_column
+            base_col = column * 2
+            hotkey_layout.addWidget(label, row, base_col)
+            hotkey_layout.addWidget(edit, row, base_col + 1)
             self.hotkey_edits[action] = edit
+
+        for column in range(columns):
+            hotkey_layout.setColumnStretch(column * 2, 0)
+            hotkey_layout.setColumnStretch(column * 2 + 1, 1)
+
         hotkey_group.setLayout(hotkey_layout)
         main_layout.addWidget(hotkey_group)
 
