@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStackedWidget,
     QToolBar, QDialog, QFormLayout, QGridLayout, QSpinBox, QLineEdit, QDialogButtonBox,
     QSizePolicy, QGroupBox, QGraphicsDropShadowEffect, QRadioButton, QSpacerItem,
-    QProgressDialog
+    QProgressDialog, QScrollArea
 )
 
 try:
@@ -2113,41 +2113,226 @@ class CullingWidget(QWidget):
         self._set_meta_label(m_final)
 
     def show_help(self):
-        hotkeys = self.settings.hotkeys
-        def binding_display(action: str) -> str:
-            value = (hotkeys.get(action) or '').strip()
-            if value:
-                return value
-            return 'Disabled'
+        self.show_tutorial(first_run=False)
 
-        rating_lines = [
-            f"{stars}★: {binding_display(f'rate_{stars}')}" for stars in range(1, 6)
-        ]
-        color_labels = [
-            ('label_red', 'Red'),
-            ('label_yellow', 'Yellow'),
-            ('label_green', 'Green'),
-            ('label_blue', 'Blue'),
-            ('label_purple', 'Purple'),
-        ]
-        color_lines = [
-            f"{label}: {binding_display(action)}" for action, label in color_labels
-        ]
+    def show_tutorial(self, first_run: bool = False):
+        html = self._build_tutorial_html(first_run=first_run)
+        self._show_rich_text_dialog(
+            title="Quick Start Guide",
+            html=html,
+            first_run=first_run,
+        )
 
-        xmp_hotkeys = (
-            "<b>Rating & Labels:</b>\n"
-            f"  {', '.join(rating_lines)}\n"
-            f"  {', '.join(color_lines)}"
+    def _show_rich_text_dialog(self, title: str, html: str, *, first_run: bool):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setModal(True)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #202124;
+            }
+            QDialogButtonBox QPushButton {
+                background-color: #3c4043;
+                color: #f8f9fa;
+                padding: 8px 18px;
+                border-radius: 6px;
+                font-weight: 600;
+            }
+            QDialogButtonBox QPushButton:hover {
+                background-color: #4a4e52;
+            }
+            QDialogButtonBox QPushButton:pressed {
+                background-color: #5f6368;
+            }
+        """)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 24, 24, 20)
+        layout.setSpacing(18)
+
+        scroll = QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+
+        label = QLabel(container)
+        label.setTextFormat(Qt.RichText)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        label.setOpenExternalLinks(True)
+        label.setStyleSheet("QLabel { color: #e8eaed; font-size: 10.5pt; line-height: 1.55; }")
+        label.setText(html)
+
+        container_layout.addWidget(label)
+        container_layout.addStretch(1)
+
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok, dialog)
+        ok_btn = button_box.button(QDialogButtonBox.Ok)
+        ok_btn.setText("Start culling" if first_run else "Close")
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
+
+        dialog.resize(620, 540)
+        dialog.exec()
+
+    def _format_key_binding(self, action: str) -> str:
+        binding = (self.settings.hotkeys.get(action) or '').strip()
+        key_chip_style = (
+            "display:inline-block; margin:2px 6px 2px 0; padding:4px 12px; border-radius:8px;"
+            "background:#2d3236; border:1px solid #4b4f52; color:#e8eaed;"
+            "font-family:'Gantari','Segoe UI',sans-serif; font-size:9.5pt; font-weight:600;"
         )
-        QMessageBox.information(self, "Key Bindings",
-            f"Navigate: {hotkeys.get('next','')} (Next), {hotkeys.get('prev','')} (Previous)\n"
-            f"Mouse: Wheel to zoom, Drag to pan (when zoomed)\n"
-            f"Select: {hotkeys.get('toggle_select','')} (Toggle), {hotkeys.get('unselect','')} (Unselect)\n"
-            f"View Modes: {hotkeys.get('toggle_zebra','')} (Toggle Zebra/Histogram), {hotkeys.get('toggle_hdr','')} (Toggle Faux HDR Preview)\n"
-            f"Save/Export: {hotkeys.get('save','')} (Save selections.json), {hotkeys.get('export','')} (Export)\n"
-            f"Exit: {hotkeys.get('quit','')}\n\n"
-            f"{xmp_hotkeys}"
+        disabled_chip = (
+            "<span style='display:inline-block; margin:2px 6px 2px 0; padding:4px 12px; border-radius:8px;"
+            " background:#2b2b2b; border:1px solid #3a3a3a; color:#9aa0a6;"
+            " font-family:'Gantari','Segoe UI',sans-serif; font-size:9.5pt;'>Not assigned</span>"
         )
+
+        if not binding:
+            return disabled_chip
+
+        normalized = binding.replace(' / ', ',').replace('/', ',')
+        tokens = [tok.strip() for tok in normalized.split(',') if tok.strip()]
+        if not tokens:
+            tokens = [binding]
+
+        return ''.join(
+            f"<span style='{key_chip_style}'>{_h(token)}</span>"
+            for token in tokens
+        )
+
+    def _build_hotkey_row(self, label: str, action: str) -> str:
+        return (
+            "<div style='display:flex; align-items:center; margin-top:10px;'>"
+            f"<div style='flex:0 0 200px; color:#f1f3f4; font-weight:600;'>{_h(label)}</div>"
+            f"<div style='flex:1;'>{self._format_key_binding(action)}</div>"
+            "</div>"
+        )
+
+    def _build_hotkey_section(self, title: str, entries: List[Tuple[str, str]]) -> str:
+        rows = ''.join(self._build_hotkey_row(label, action) for label, action in entries)
+        return (
+            "<div style='margin-top:24px;'>"
+            f"<div style='color:#8ab4f8; font-size:11pt; font-weight:700; letter-spacing:0.8px; text-transform:uppercase;'>{_h(title)}</div>"
+            f"{rows}"
+            "</div>"
+        )
+
+    def _build_info_row(self, label: str, description_html: str) -> str:
+        return (
+            "<div style='display:flex; align-items:flex-start; margin-top:10px;'>"
+            f"<div style='flex:0 0 200px; color:#f1f3f4; font-weight:600;'>{_h(label)}</div>"
+            f"<div style='flex:1; color:#c8c8c8;'>{description_html}</div>"
+            "</div>"
+        )
+
+    def _build_tutorial_html(self, first_run: bool) -> str:
+        intro = (
+            "Welcome to <b>Simple Raw Picker</b>! Here's a quick tour of the shortcuts you'll use the most while culling. "
+            "You can reopen this guide anytime with <b>F1</b>."
+            if first_run
+            else
+            "Here's a refresher on the workflow and shortcuts. Press <b>F1</b> whenever you want to see this guide again."
+        )
+
+        workflow_section = self._build_hotkey_section("Workflow Basics", [
+            ("Pick / Unpick photo", 'toggle_select'),
+            ("Clear pick", 'unselect'),
+            ("Save progress", 'save'),
+            ("Export selected set", 'export'),
+        ])
+
+        export_binding = self._format_key_binding('export')
+        if 'Not assigned' in export_binding:
+            quick_export_desc = "Need the files without closing the session? Click <b>Export</b> from the toolbar to sync the currently selected photos."
+        else:
+            quick_export_desc = (
+                "Need the files without closing the session? Click <b>Export</b> or press "
+                f"{export_binding} to sync the currently selected photos."
+            )
+        toolbar_section = (
+            "<div style='margin-top:24px;'>"
+            "<div style='color:#8ab4f8; font-size:11pt; font-weight:700; letter-spacing:0.8px; text-transform:uppercase;'>Toolbar Actions</div>"
+            f"{self._build_info_row('Complete session', 'Use the <b>Complete</b> toolbar button when you are ready to wrap up. It exports your picks, closes the project, and brings you back to the welcome screen.')}"
+            f"{self._build_info_row('Quick export', quick_export_desc)}"
+            "</div>"
+        )
+
+        navigation_section = self._build_hotkey_section("Navigation & View", [
+            ("Next photo", 'next'),
+            ("Previous photo", 'prev'),
+            ("Toggle zebra overlay", 'toggle_zebra'),
+            ("Toggle HDR preview", 'toggle_hdr'),
+            ("Show this guide", 'help'),
+            ("Quit application", 'quit'),
+        ])
+
+        ratings_section = self._build_hotkey_section(
+            "Star Ratings",
+            [(f"{stars} star{'s' if stars > 1 else ''}", f"rate_{stars}") for stars in range(1, 6)],
+        )
+
+        color_section = self._build_hotkey_section("Colour Labels", [
+            ("Red label", 'label_red'),
+            ("Yellow label", 'label_yellow'),
+            ("Green label", 'label_green'),
+            ("Blue label", 'label_blue'),
+            ("Purple label", 'label_purple'),
+        ])
+
+        tips_rows = [
+            ("Mouse & zoom", "Scroll to zoom. Drag with the left mouse button to pan while zoomed."),
+            (
+                "Autosave",
+                f"Selections are stored automatically every <b>{int(self.settings.autosave_interval_min)}</b> minute(s) and whenever you leave the folder.",
+            ),
+            (
+                "Customize",
+                "Open <b>Settings</b> in the toolbar to adjust shortcuts, cache sizes, and export folders.",
+            ),
+            (
+                "Recent folders",
+                "Your latest sessions appear on the welcome screen so you can jump back in quickly.",
+            ),
+        ]
+        tips_section = (
+            "<div style='margin-top:24px;'>"
+            "<div style='color:#8ab4f8; font-size:11pt; font-weight:700; letter-spacing:0.8px; text-transform:uppercase;'>Tips</div>"
+            f"{''.join(self._build_info_row(label, text) for label, text in tips_rows)}"
+            "</div>"
+        )
+
+        extra_note = ""
+        if exiv2 is None:
+            extra_note = (
+                "<div style='margin-top:18px; padding:12px 16px; border-radius:10px; background:#3c1f1f; color:#f28b82; font-weight:600;'>"
+                "Install <code>py3exiv2</code> to enable star ratings and colour labels for XMP sidecars."
+                "</div>"
+            )
+
+        html = (
+            "<div style='padding:4px;'>"
+            "<div style='color:#f8f9fa; font-size:20px; font-weight:700; margin-bottom:6px;'>Quick Start Guide</div>"
+            f"<div style='color:#c8c8c8; font-size:10.5pt; line-height:1.6; margin-bottom:16px;'>{intro}</div>"
+            f"{workflow_section}"
+            f"{navigation_section}"
+            f"{toolbar_section}"
+            f"{ratings_section}"
+            f"{color_section}"
+            f"{tips_section}"
+            f"{extra_note}"
+            "<div style='margin-top:24px; color:#9aa0a6; font-size:9.5pt;'>Need a reminder later? Press <b>F1</b> at any time.</div>"
+            "</div>"
+        )
+        return html
 
     def _current(self) -> Optional[Photo]:
         if not self.catalog.photos: return None
@@ -3229,6 +3414,7 @@ class AppWindow(QMainWindow):
         os.makedirs(self.app_data_path, exist_ok=True)
         self.app_state_file = os.path.join(self.app_data_path, "app_state.json")
         self.recent_folders = []
+        self.has_seen_tutorial = False
         self._load_app_state()
 
         self.stack = QStackedWidget()
@@ -3252,12 +3438,17 @@ class AppWindow(QMainWindow):
             with open(self.app_state_file, 'r', encoding='utf-8') as f:
                 state = json.load(f)
                 self.recent_folders = state.get("recent_folders", [])
+                self.has_seen_tutorial = bool(state.get("has_seen_tutorial", False))
         except (FileNotFoundError, json.JSONDecodeError):
             self.recent_folders = []
+            self.has_seen_tutorial = False
 
     def _save_app_state(self):
         try:
-            state = {"recent_folders": self.recent_folders}
+            state = {
+                "recent_folders": self.recent_folders,
+                "has_seen_tutorial": bool(self.has_seen_tutorial),
+            }
             with open(self.app_state_file, 'w', encoding='utf-8') as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
@@ -3317,6 +3508,9 @@ class AppWindow(QMainWindow):
             self.recent_folders.remove(root)
         self.recent_folders.insert(0, root)
         self.recent_folders = self.recent_folders[:5]
+        first_time_tutorial = not self.has_seen_tutorial
+        if first_time_tutorial:
+            self.has_seen_tutorial = True
         self._save_app_state()
 
         self.culling_widget = CullingWidget(
@@ -3331,6 +3525,9 @@ class AppWindow(QMainWindow):
         self.stack.setCurrentWidget(self.culling_widget)
         self.update_toolbar_state(is_culling=True)
 
+        if first_time_tutorial:
+            QTimer.singleShot(250, lambda: self.culling_widget.show_tutorial(first_run=True))
+
     def open_settings(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec():
@@ -3340,11 +3537,15 @@ class AppWindow(QMainWindow):
             
     def open_help(self):
         if self.culling_widget:
-            self.culling_widget.show_help()
+            self.culling_widget.show_tutorial(first_run=False)
         else:
-            QMessageBox.information(self, "Help", 
-                "Open a folder to start.\n\n"
-                "Shortcuts will be available during culling.")
+            QMessageBox.information(
+                self,
+                "Quick Start",
+                "Select a folder to begin culling your RAW files.\n\n"
+                "Once a folder is open, press F1 at any time to read the shortcut guide."
+                " When you're finished reviewing, use the toolbar's Complete button to export and wrap up the session.",
+            )
 
     def _perform_export(
         self,
