@@ -2795,8 +2795,8 @@ class AppWindow(QMainWindow):
             except Exception:
                 return True
 
-        def _list_by_basename(folder: str, exts: set) -> Dict[str, str]:
-            out = {}
+        def _list_paths_by_basename(folder: str, exts: set) -> Dict[str, List[str]]:
+            out: Dict[str, List[str]] = {}
             try:
                 for fn in os.listdir(folder):
                     p = os.path.join(folder, fn)
@@ -2804,7 +2804,7 @@ class AppWindow(QMainWindow):
                         continue
                     base, ext = os.path.splitext(fn)
                     if ext.lower() in exts:
-                        out[base] = p
+                        out.setdefault(base, []).append(p)
             except Exception:
                 pass
             return out
@@ -2825,18 +2825,19 @@ class AppWindow(QMainWindow):
         os.makedirs(jpeg_out_dir, exist_ok=True)
 
         selected_raw_by_base = {os.path.splitext(os.path.basename(p))[0]: p for p in selected_raw_paths}
-        root_jpegs_by_base = _list_by_basename(root, {'.jpg', '.jpeg'})
+        root_jpegs_by_base = _list_paths_by_basename(root, {'.jpg', '.jpeg'})
 
-        dest_raw_by_base = _list_by_basename(raw_out_dir, SUPPORTED_EXTS.union({'.xmp'}))
-        dest_jpg_by_base = _list_by_basename(jpeg_out_dir, {'.jpg', '.jpeg'})
+        dest_raw_by_base = _list_paths_by_basename(raw_out_dir, SUPPORTED_EXTS.union({'.xmp'}))
+        dest_jpg_by_base = _list_paths_by_basename(jpeg_out_dir, {'.jpg', '.jpeg'})
 
         copied_raw = 0
         copied_jpg = 0
 
-        for base, dst_path in list(dest_raw_by_base.items()):
+        for base, dst_paths in list(dest_raw_by_base.items()):
             if base not in selected_raw_by_base:
-                try: os.remove(dst_path)
-                except Exception: pass
+                for dst_path in dst_paths:
+                    try: os.remove(dst_path)
+                    except Exception: pass
 
         for base, src_path in selected_raw_by_base.items():
             dst_path = os.path.join(raw_out_dir, os.path.basename(src_path))
@@ -2853,13 +2854,14 @@ class AppWindow(QMainWindow):
 
         desired_jpg_bases = {b for b in selected_raw_by_base if b in root_jpegs_by_base}
 
-        for base, dst_path in list(dest_jpg_by_base.items()):
+        for base, dst_paths in list(dest_jpg_by_base.items()):
             if base not in desired_jpg_bases:
-                try: os.remove(dst_path)
-                except Exception: pass
+                for dst_path in dst_paths:
+                    try: os.remove(dst_path)
+                    except Exception: pass
 
         for base in desired_jpg_bases:
-            src_jpg = root_jpegs_by_base[base]
+            src_jpg = root_jpegs_by_base[base][0]
             dst_jpg = os.path.join(jpeg_out_dir, os.path.basename(src_jpg))
             try:
                 if _needs_copy(src_jpg, dst_jpg):
@@ -2868,8 +2870,8 @@ class AppWindow(QMainWindow):
             except Exception as e:
                 print(f"[JPEG sync] copy failed: {src_jpg} -> {dst_jpg}: {e}")
 
-        dest_raw_count = len(_list_by_basename(raw_out_dir, SUPPORTED_EXTS))
-        dest_jpeg_count = len(_list_by_basename(jpeg_out_dir, {'.jpg', '.jpeg'}))
+        dest_raw_count = len(_list_paths_by_basename(raw_out_dir, SUPPORTED_EXTS))
+        dest_jpeg_count = len(_list_paths_by_basename(jpeg_out_dir, {'.jpg', '.jpeg'}))
 
         return (copied_raw, raw_out_dir, copied_jpg, jpeg_out_dir,
                 selected_count, dest_raw_count, dest_jpeg_count)
