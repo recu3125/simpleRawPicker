@@ -2125,10 +2125,8 @@ class CullingWidget(QWidget):
         cur = self._current()
         if cur and cur.path == path:
             self.view.set_selected(current_selected)
-            self._update_filmstrip()
-        else:
-            self.filmstrip.update()
-
+            
+        self._update_filmstrip()
         self._update_selected_badge_fast()
         
     def _refresh_statusbar(self):
