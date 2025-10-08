@@ -2213,7 +2213,7 @@ class CullingWidget(QWidget):
         except Exception:
             pass
 
-    def save_all_dirty_files(self):
+    def save_all_dirty_files(self, wait: bool = False):
         """메모리에서 변경된 모든 사항(selections.json 및 XMP)을 파일에 저장합니다."""
         self.autosave_timer.stop()
 
@@ -2245,7 +2245,9 @@ class CullingWidget(QWidget):
         if not tasks:
             return
 
-        def _write_task_with_cleanup(path, data, photo_obj, version):
+        wait_events: List[threading.Event] = []
+
+        def _write_task_with_cleanup(path, data, photo_obj, version, done_event: Optional[threading.Event]):
             success = False
             try:
                 success = bool(write_xmp_sidecar(path, data))
@@ -2254,30 +2256,42 @@ class CullingWidget(QWidget):
                 success = False
             finally:
                 signal_to_emit = None
-                with photo_obj.lock:
-                    if photo_obj.saving_version != version:
-                        return
-                    photo_obj.is_saving = False
-                    if photo_obj.version > version:
-                        photo_obj.is_dirty = True
-                        photo_obj.saving_version = version
-                        return
-                    if not success:
-                        photo_obj.is_dirty = True
-                        photo_obj.saving_version = version
-                        signal_to_emit = 'failed'
-                    else:
-                        photo_obj.saving_version = version
-                        signal_to_emit = 'saved'
+                try:
+                    with photo_obj.lock:
+                        if photo_obj.saving_version != version:
+                            return
+                        photo_obj.is_saving = False
+                        if photo_obj.version > version:
+                            photo_obj.is_dirty = True
+                            photo_obj.saving_version = version
+                            return
+                        if not success:
+                            photo_obj.is_dirty = True
+                            photo_obj.saving_version = version
+                            signal_to_emit = 'failed'
+                        else:
+                            photo_obj.saving_version = version
+                            signal_to_emit = 'saved'
+                finally:
+                    if done_event is not None:
+                        done_event.set()
                 if signal_to_emit == 'saved':
                     self.signals.xmp_saved.emit(path)
                 elif signal_to_emit == 'failed':
                     self.signals.xmp_save_failed.emit(path)
 
         for photo, payload, version in tasks:
-            self._post_task(20, _write_task_with_cleanup, photo.path, payload, photo, version)
+            done_event = threading.Event() if wait else None
+            if done_event is not None:
+                wait_events.append(done_event)
+            self._post_task(20, _write_task_with_cleanup, photo.path, payload, photo, version, done_event)
 
         self._show_temporary_status(f"Auto-saved metadata for {len(tasks)} photos.", 2000)
+
+        if wait and wait_events:
+            for ev in wait_events:
+                ev.wait()
+
     def cleanup(self):
         self.save_all_dirty_files() 
         self._loader_stop = True
@@ -2805,7 +2819,7 @@ class AppWindow(QMainWindow):
             return 0, "", 0, "", 0, 0, 0
 
         cw = self.culling_widget
-        cw.save_all_dirty_files() 
+        cw.save_all_dirty_files(wait=True)
 
         selected_raw_paths = [p.path for p in cw.catalog.photos if p.selected]
         selected_count = len(selected_raw_paths)
