@@ -2151,6 +2151,9 @@ class CullingWidget(QWidget):
             
         self._update_filmstrip()
         self._update_selected_badge_fast()
+
+        if selected_changed:
+            self.autosave_timer.start(1500)
         
     def _refresh_statusbar(self):
         if self.status_restore_timer.isActive(): return
@@ -2396,14 +2399,78 @@ class CullingWidget(QWidget):
             self._enqueue_xmp(photo.path, priority=100 + i)
 
     def _load_selections(self):
+        total = len(self.catalog.photos)
+        if total == 0:
+            return
+
+        if os.path.exists(self.selections_path):
+            try:
+                with open(self.selections_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                selected_set = set(data.get('selected_paths', []))
+                for p in self.catalog.photos:
+                    p.selected = (p.path in selected_set)
+            except Exception:
+                pass
+            finally:
+                self._update_selected_badge_fast()
+            return
+
+        if exiv2 is None:
+            self._update_selected_badge_fast()
+            return
+
+        app = QApplication.instance()
+        progress = None
+        if app:
+            parent = app.activeWindow()
+            progress = QProgressDialog("Reading XMP sidecars…", "", 0, total, parent)
+            progress.setCancelButton(None)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            progress.show()
+            QApplication.processEvents()
+
+        selected_paths: List[str] = []
+        for idx, photo in enumerate(self.catalog.photos, start=1):
+            data = read_xmp_sidecar(photo.path)
+            rating_val = data.get('rating') if data else None
+            label_val = data.get('color_label') if data else None
+            selected_val = data.get('selected') if data else None
+
+            with photo.lock:
+                if data:
+                    photo.xmp_loaded = True
+                if rating_val is not None:
+                    photo.rating = rating_val
+                if label_val is not None:
+                    photo.color_label = label_val
+                if selected_val is not None:
+                    photo.selected = selected_val
+
+            if photo.selected:
+                selected_paths.append(photo.path)
+
+            if progress:
+                progress.setValue(idx)
+                QApplication.processEvents()
+
+        if progress:
+            progress.close()
+
+        self._update_selected_badge_fast()
+
+        data = {
+            'root': self.catalog.root,
+            'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'selected_paths': selected_paths,
+        }
         try:
-            with open(self.selections_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            selected_set = set(data.get('selected_paths', []))
-            for p in self.catalog.photos:
-                p.selected = (p.path in selected_set)
-        except Exception:
-            pass
+            with open(self.selections_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Error creating selections.json: {e}")
 
     def save_all_dirty_files(self, wait: bool = False):
         """메모리에서 변경된 모든 사항(selections.json 및 XMP)을 파일에 저장합니다."""
