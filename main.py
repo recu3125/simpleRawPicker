@@ -1479,17 +1479,59 @@ class CullingWidget(QWidget):
         now = time.monotonic()
         self._last_input_ts = now
 
-    def _flush_queue(self):
+    def _is_metadata_save_task(self, fn, args) -> bool:
+        if getattr(fn, "_srp_metadata_save", False):
+            return True
+        if getattr(fn, "__name__", "") != "_write_task_with_cleanup":
+            return False
+        return len(args) >= 4 and isinstance(args[2], Photo)
+
+    def _restore_cancelled_save_task(self, args) -> bool:
+        try:
+            photo_obj = args[2]
+            version = args[3]
+        except Exception:
+            return False
+        if not isinstance(photo_obj, Photo):
+            return False
+        restored = False
+        with photo_obj.lock:
+            if photo_obj.saving_version == version and photo_obj.is_saving:
+                photo_obj.is_saving = False
+                photo_obj.is_dirty = True
+                photo_obj.saving_version = version
+                restored = True
+        return restored
+
+    def _flush_queue(self, preserve_metadata: bool = True):
         flushed = 0
+        preserved: List[Tuple] = []
+        restores = 0
         try:
             while True:
-                self._taskq.get_nowait()
-                self._taskq.task_done(); flushed += 1
+                item = self._taskq.get_nowait()
+                _, _, fn, args = item
+                is_save_task = self._is_metadata_save_task(fn, args)
+                if preserve_metadata and is_save_task:
+                    preserved.append(item)
+                else:
+                    if is_save_task and self._restore_cancelled_save_task(args):
+                        restores += 1
+                    flushed += 1
+                try:
+                    self._taskq.task_done()
+                except Exception:
+                    pass
         except Empty:
             pass
+        for item in preserved:
+            self._taskq.put(item)
         with self._pending_lock:
             p = len(self._pending_tasks); self._pending_tasks.clear()
-        _plog(f"flush queue: removed={flushed}, cleared_pending={p}")
+        _plog(
+            f"flush queue: removed={flushed}, preserved_saves={len(preserved)}, "
+            f"restored={restores}, cleared_pending={p}"
+        )
         
     def _update_selected_badge_fast(self):
         total_sel = sum(1 for x in self.catalog.photos if x.selected)
@@ -2274,21 +2316,29 @@ class CullingWidget(QWidget):
                 elif signal_to_emit == 'failed':
                     self.signals.xmp_save_failed.emit(path)
 
+        setattr(_write_task_with_cleanup, "_srp_metadata_save", True)
+
         for photo, payload, version in tasks:
             self._post_task(20, _write_task_with_cleanup, photo.path, payload, photo, version)
 
         self._show_temporary_status(f"Auto-saved metadata for {len(tasks)} photos.", 2000)
     def cleanup(self):
-        self.save_all_dirty_files() 
+        try:
+            self.autosave_timer.stop()
+            self.autosave_interval_timer.stop()
+        except Exception:
+            pass
+
+        self.save_all_dirty_files()
+        self._flush_queue()
+
+        try:
+            self._taskq.join()
+        except Exception:
+            pass
+
         self._loader_stop = True
         try:
-            while True:
-                self._taskq.get_nowait(); self._taskq.task_done()
-        except Empty:
-            pass
-        try:
-            for _ in range(len(self._loader_threads)):
-                self._taskq.put((9999, 0, lambda: None, ()))
             for t in self._loader_threads:
                 t.join(timeout=0.5)
         except Exception:
