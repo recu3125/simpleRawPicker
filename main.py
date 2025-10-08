@@ -679,17 +679,25 @@ class ImageView(QLabel):
 
         area = self.contentsRect()
         dpr = self.devicePixelRatioF()
+        target_w_px = max(1, int(area.width() * dpr))
         target_h_px = max(1, int(area.height() * dpr))
 
-        with _ptime(f"pm.scaledToHeight target_h={target_h_px}", warn_ms=10):
-            pm2 = pm.scaledToHeight(target_h_px, Qt.SmoothTransformation)
+        with _ptime(
+            f"pm.scaled target={target_w_px}x{target_h_px}",
+            warn_ms=10,
+        ):
+            pm2 = pm.scaled(
+                QSize(target_w_px, target_h_px),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
             pm2.setDevicePixelRatio(dpr)
 
-        disp_w = max(1, int(round(pm2.width()  / dpr)))
+        disp_w = max(1, int(round(pm2.width() / dpr)))
         disp_h = max(1, int(round(pm2.height() / dpr)))
 
         x = area.x() + (area.width() - disp_w) // 2
-        y = area.y()
+        y = area.y() + (area.height() - disp_h) // 2
         self._pm_rect = QRect(x, y, disp_w, disp_h)
         super().setPixmap(pm2)
 
