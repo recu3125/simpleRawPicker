@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, sys, io, json, time, shutil, argparse
+import os, sys, io, json, time, shutil, argparse, traceback
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
@@ -19,7 +19,7 @@ import numpy as np
 from PIL import Image, ImageQt, ImageOps
 import rawpy
 
-from PySide6.QtCore import Qt, QSize, QRect, QRectF, QPoint, QTimer, QObject, Signal, Slot, QEvent, QElapsedTimer, QStandardPaths
+from PySide6.QtCore import Qt, QSize, QRect, QRectF, QPoint, QTimer, QObject, Signal, Slot, QEvent, QElapsedTimer, QStandardPaths, QThread
 from PySide6.QtGui import QPixmap, QKeySequence, QAction, QPainter, QPen, QColor, QFontDatabase, QFont, QIcon, QImage, QPolygon, QPainterPath, QBrush
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QMessageBox, QFrame,
@@ -55,6 +55,53 @@ def _ptime(label: str, warn_ms: float = 16.0):
 SUPPORTED_EXTS = {
     '.cr3', '.cr2', '.nef', '.arw', '.raf', '.dng', '.orf', '.rw2', '.srw', '.pef'
 }
+
+@dataclass
+class ExportJob:
+    root: str
+    selected_raw_paths: List[str]
+    raw_output_folder_name: str
+    jpeg_output_folder_name: str
+
+
+class ExportCancelledError(Exception):
+    pass
+
+
+class ExportWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(tuple)
+    failed = Signal(str, str)
+    cancelled = Signal()
+
+    def __init__(self, job: ExportJob, perform_export_fn):
+        super().__init__()
+        self.job = job
+        self._perform_export_fn = perform_export_fn
+        self._cancel_event = threading.Event()
+
+    @Slot()
+    def run(self):
+        try:
+            result = self._perform_export_fn(
+                self.job,
+                self._emit_progress,
+                self._cancel_event.is_set
+            )
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+            self.finished.emit(result)
+        except ExportCancelledError:
+            self.cancelled.emit()
+        except Exception as e:
+            self.failed.emit(str(e), traceback.format_exc())
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def _emit_progress(self, current: int, total: int, message: str):
+        self.progress.emit(current, total, message)
 
 _XMP_GLOBAL_LOCK = threading.Lock()
 def read_xmp_sidecar(path: str) -> Dict:
@@ -2656,7 +2703,11 @@ class AppWindow(QMainWindow):
         self.args = args
         self.settings = AppSettings()
         self.culling_widget: Optional[CullingWidget] = None
-        
+        self._export_worker: Optional[ExportWorker] = None
+        self._export_thread: Optional[QThread] = None
+        self._export_dialog: Optional[QProgressDialog] = None
+        self._export_intent: Optional[str] = None
+
         self.app_data_path = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
         os.makedirs(self.app_data_path, exist_ok=True)
         self.app_state_file = os.path.join(self.app_data_path, "app_state.json")
@@ -2769,11 +2820,24 @@ class AppWindow(QMainWindow):
         if self.culling_widget:
             self.culling_widget.show_help()
         else:
-            QMessageBox.information(self, "Help", 
+            QMessageBox.information(self, "Help",
                 "Open a folder to start.\n\n"
                 "Shortcuts will be available during culling.")
 
-    def _perform_export(self) -> Tuple[int, str, int, str, int, int, int]:
+    @staticmethod
+    def _perform_export(job: ExportJob,
+                        progress_callback=None,
+                        is_cancelled=None) -> Tuple[int, str, int, str, int, int, int]:
+        is_cancelled = is_cancelled or (lambda: False)
+
+        def _check_cancel():
+            if is_cancelled():
+                raise ExportCancelledError()
+
+        def _emit(current: int, total: int, message: str):
+            if progress_callback:
+                progress_callback(current, total, message)
+
         def _needs_copy(src: str, dst: str) -> bool:
             try:
                 s, d = os.stat(src), os.stat(dst)
@@ -2801,100 +2865,255 @@ class AppWindow(QMainWindow):
                 pass
             return out
 
-        if not self.culling_widget:
-            return 0, "", 0, "", 0, 0, 0
-
-        cw = self.culling_widget
-        cw.save_all_dirty_files() 
-
-        selected_raw_paths = [p.path for p in cw.catalog.photos if p.selected]
+        selected_raw_paths = list(job.selected_raw_paths)
         selected_count = len(selected_raw_paths)
-        root = cw.catalog.root
+        root = job.root
 
-        raw_out_dir = os.path.join(root, self.settings.raw_output_folder_name)
-        jpeg_out_dir = os.path.join(root, self.settings.jpeg_output_folder_name)
+        raw_out_dir = os.path.join(root, job.raw_output_folder_name)
+        jpeg_out_dir = os.path.join(root, job.jpeg_output_folder_name)
+
+        _check_cancel()
         os.makedirs(raw_out_dir, exist_ok=True)
         os.makedirs(jpeg_out_dir, exist_ok=True)
 
         selected_raw_by_base = {os.path.splitext(os.path.basename(p))[0]: p for p in selected_raw_paths}
         root_jpegs_by_base = _list_by_basename(root, {'.jpg', '.jpeg'})
 
+        _check_cancel()
         dest_raw_by_base = _list_by_basename(raw_out_dir, SUPPORTED_EXTS.union({'.xmp'}))
         dest_jpg_by_base = _list_by_basename(jpeg_out_dir, {'.jpg', '.jpeg'})
 
-        copied_raw = 0
-        copied_jpg = 0
-
         for base, dst_path in list(dest_raw_by_base.items()):
+            _check_cancel()
             if base not in selected_raw_by_base:
-                try: os.remove(dst_path)
-                except Exception: pass
-
-        for base, src_path in selected_raw_by_base.items():
-            dst_path = os.path.join(raw_out_dir, os.path.basename(src_path))
-            try:
-                if _needs_copy(src_path, dst_path):
-                    shutil.copy2(src_path, dst_path)
-                    copied_raw += 1
-                src_xmp = os.path.splitext(src_path)[0] + '.xmp'
-                dst_xmp = os.path.splitext(dst_path)[0] + '.xmp'
-                if os.path.exists(src_xmp) and _needs_copy(src_xmp, dst_xmp):
-                    shutil.copy2(src_xmp, dst_xmp)
-            except Exception as e:
-                print(f"[RAW sync] copy failed: {src_path} -> {dst_path}: {e}")
+                try:
+                    os.remove(dst_path)
+                except Exception:
+                    pass
 
         desired_jpg_bases = {b for b in selected_raw_by_base if b in root_jpegs_by_base}
 
         for base, dst_path in list(dest_jpg_by_base.items()):
+            _check_cancel()
             if base not in desired_jpg_bases:
-                try: os.remove(dst_path)
-                except Exception: pass
+                try:
+                    os.remove(dst_path)
+                except Exception:
+                    pass
+
+        copy_tasks: List[Tuple[str, str, str]] = []
+        for base, src_path in selected_raw_by_base.items():
+            _check_cancel()
+            dst_path = os.path.join(raw_out_dir, os.path.basename(src_path))
+            if _needs_copy(src_path, dst_path):
+                copy_tasks.append(("raw", src_path, dst_path))
+            src_xmp = os.path.splitext(src_path)[0] + '.xmp'
+            dst_xmp = os.path.splitext(dst_path)[0] + '.xmp'
+            if os.path.exists(src_xmp) and _needs_copy(src_xmp, dst_xmp):
+                copy_tasks.append(("xmp", src_xmp, dst_xmp))
 
         for base in desired_jpg_bases:
+            _check_cancel()
             src_jpg = root_jpegs_by_base[base]
             dst_jpg = os.path.join(jpeg_out_dir, os.path.basename(src_jpg))
+            if _needs_copy(src_jpg, dst_jpg):
+                copy_tasks.append(("jpeg", src_jpg, dst_jpg))
+
+        errors: List[str] = []
+        copied_raw = 0
+        copied_jpg = 0
+        total_tasks = len(copy_tasks)
+        progress_total = max(total_tasks, 1)
+        if total_tasks == 0:
+            _emit(0, progress_total, "No files required copying")
+        else:
+            _emit(0, progress_total, "Preparing export...")
+
+        for idx, (kind, src, dst) in enumerate(copy_tasks, start=1):
+            _check_cancel()
+            filename = os.path.basename(src)
+            _emit(idx - 1, progress_total, f"Copying {filename}")
             try:
-                if _needs_copy(src_jpg, dst_jpg):
-                    shutil.copy2(src_jpg, dst_jpg)
-                    copied_jpg += 1
+                shutil.copy2(src, dst)
             except Exception as e:
-                print(f"[JPEG sync] copy failed: {src_jpg} -> {dst_jpg}: {e}")
+                if kind == 'raw':
+                    errors.append(f"[RAW sync] copy failed: {src} -> {dst}: {e}")
+                elif kind == 'jpeg':
+                    errors.append(f"[JPEG sync] copy failed: {src} -> {dst}: {e}")
+                else:
+                    errors.append(f"[XMP sync] copy failed: {src} -> {dst}: {e}")
+            else:
+                if kind == 'raw':
+                    copied_raw += 1
+                elif kind == 'jpeg':
+                    copied_jpg += 1
+            finally:
+                _emit(idx, progress_total, f"Copying {filename}")
+
+        _emit(progress_total, progress_total, "Finalizing export...")
+        _check_cancel()
 
         dest_raw_count = len(_list_by_basename(raw_out_dir, SUPPORTED_EXTS))
+        _check_cancel()
         dest_jpeg_count = len(_list_by_basename(jpeg_out_dir, {'.jpg', '.jpeg'}))
+
+        if errors:
+            raise RuntimeError("Export encountered errors:\n" + "\n".join(errors))
 
         return (copied_raw, raw_out_dir, copied_jpg, jpeg_out_dir,
                 selected_count, dest_raw_count, dest_jpeg_count)
 
-    def handle_export(self):
-        (_copied_raw, _raw_path, _copied_jpg, _jpg_path,
-        selected_count, dest_raw_count, dest_jpeg_count) = self._perform_export()
+    def _set_export_controls_enabled(self, enabled: bool):
+        if self.culling_widget:
+            export_action = self.culling_widget.actions.get('export')
+            if export_action:
+                export_action.setEnabled(enabled)
+        if enabled:
+            self.update_toolbar_state(is_culling=bool(self.culling_widget))
+        else:
+            self.act_complete.setEnabled(False)
 
-        msg = f"Sync complete · {selected_count} selected → {dest_raw_count} RAW, {dest_jpeg_count} JPEG"
-        self._show_toast(msg, 1500)
+    def _start_export(self, mode: str):
+        if not self.culling_widget:
+            return
+        if self._export_worker is not None:
+            self._show_toast("Export already in progress", 2000)
+            return
+
+        cw = self.culling_widget
+        cw.save_all_dirty_files()
+
+        job = ExportJob(
+            root=cw.catalog.root,
+            selected_raw_paths=[p.path for p in cw.catalog.photos if p.selected],
+            raw_output_folder_name=self.settings.raw_output_folder_name,
+            jpeg_output_folder_name=self.settings.jpeg_output_folder_name
+        )
+
+        self._export_intent = mode
+        self._set_export_controls_enabled(False)
+
+        dialog = QProgressDialog("Preparing export...", "Cancel", 0, 1, self)
+        dialog.setWindowTitle("Exporting")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        dialog.setLabelText("Preparing export...")
+        dialog.canceled.connect(self._cancel_export)
+        self._export_dialog = dialog
+
+        worker = ExportWorker(job, AppWindow._perform_export)
+        thread = QThread(self)
+        self._export_worker = worker
+        self._export_thread = thread
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_export_progress)
+        worker.finished.connect(self._on_export_finished)
+        worker.failed.connect(self._on_export_failed)
+        worker.cancelled.connect(self._on_export_cancelled)
+        thread.start()
+        dialog.show()
+
+    def _cancel_export(self):
+        if self._export_worker:
+            self._export_worker.cancel()
+        if self._export_dialog:
+            self._export_dialog.setLabelText("Cancelling...")
+            self._export_dialog.setCancelButton(None)
+
+    def _on_export_progress(self, current: int, total: int, message: str):
+        if not self._export_dialog:
+            return
+        total = max(total, 1)
+        self._export_dialog.setRange(0, total)
+        self._export_dialog.setValue(min(current, total))
+        if message:
+            self._export_dialog.setLabelText(message)
+
+    def _on_export_finished(self, result):
+        mode = self._export_intent
+        self._export_intent = None
+        self._teardown_export_worker()
+        self._finalize_export_ui()
+        self._handle_export_success(result, mode)
+
+    def _on_export_failed(self, message: str, details: str):
+        self._export_intent = None
+        self._teardown_export_worker()
+        self._finalize_export_ui()
+        if details:
+            print(details, file=sys.stderr)
+        box = QMessageBox(self)
+        box.setWindowTitle("Export Failed")
+        box.setIcon(QMessageBox.Critical)
+        text = message or "Export failed."
+        box.setText(text)
+        if details:
+            box.setDetailedText(details)
+        box.exec()
+        self._show_toast("Export failed", 2000)
+
+    def _on_export_cancelled(self):
+        self._export_intent = None
+        self._teardown_export_worker()
+        self._finalize_export_ui()
+        self._show_toast("Export cancelled", 2000)
+
+    def _teardown_export_worker(self):
+        worker, thread = self._export_worker, self._export_thread
+        self._export_worker = None
+        self._export_thread = None
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            thread.deleteLater()
+
+    def _finalize_export_ui(self):
+        if self._export_dialog:
+            self._export_dialog.hide()
+            self._export_dialog.deleteLater()
+            self._export_dialog = None
+        self._set_export_controls_enabled(True)
+
+    def _handle_export_success(self, result: Tuple[int, str, int, str, int, int, int], mode: Optional[str]):
+        (copied_raw, raw_path, copied_jpg, jpeg_path,
+         selected_count, dest_raw_count, dest_jpeg_count) = result
+
+        if mode == "complete":
+            dlg = CompletionDialog("Culling Complete",
+                                  selected_count,
+                                  raw_path, dest_raw_count,
+                                  jpeg_path, dest_jpeg_count,
+                                  self)
+            dlg.exec()
+
+            if self.culling_widget:
+                self.culling_widget.cleanup()
+                self.stack.removeWidget(self.culling_widget)
+                self.culling_widget.deleteLater()
+                self.culling_widget = None
+
+            self._load_app_state()
+            self.welcome_screen.update_recent_folders(self.recent_folders)
+            self.stack.setCurrentWidget(self.welcome_screen)
+            self.update_toolbar_state(is_culling=False)
+            self.status.clearMessage()
+        else:
+            msg = (f"Sync complete · {selected_count} selected → "
+                   f"{dest_raw_count} RAW, {dest_jpeg_count} JPEG")
+            self._show_toast(msg, 2000)
+
+    def handle_export(self):
+        self._start_export(mode="sync")
 
     def complete_culling(self):
-        (copied_raw, raw_path, copied_jpg, jpeg_path,
-        selected_count, dest_raw_count, dest_jpeg_count) = self._perform_export()
+        self._start_export(mode="complete")
 
-        dlg = CompletionDialog("Culling Complete",
-                              selected_count,
-                              raw_path, dest_raw_count,
-                              jpeg_path, dest_jpeg_count,
-                              self)
-        dlg.exec()
-
-        if self.culling_widget:
-            self.culling_widget.cleanup()
-            self.stack.removeWidget(self.culling_widget)
-            self.culling_widget.deleteLater()
-            self.culling_widget = None
-
-        self._load_app_state()
-        self.welcome_screen.update_recent_folders(self.recent_folders)
-        self.stack.setCurrentWidget(self.welcome_screen)
-        self.update_toolbar_state(is_culling=False)
-        self.status.clearMessage()
     def _show_toast(self, text: str, ms: int = 1500):
         if not hasattr(self, "_toast_label"):
             self._toast_label = QLabel(self)
