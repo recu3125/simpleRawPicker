@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os, sys, io, json, time, shutil, argparse, traceback
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, List, Dict, Optional, Tuple
 from datetime import datetime
@@ -3757,11 +3758,22 @@ def main():
     
     setattr(app, "_profile_enabled", bool(args.profile))
 
-    font_path = "Gantari-Regular.ttf"
+    resource_root = Path(__file__).resolve().parent
     if hasattr(sys, '_MEIPASS'):
-        font_path = os.path.join(sys._MEIPASS, font_path)
+        resource_root = Path(sys._MEIPASS)
 
-    font_id = QFontDatabase.addApplicationFont(font_path)
+    font_path = resource_root / "Gantari-Regular.ttf"
+
+    if not font_path.exists():
+        print(
+            "Warning: Font file not found at '{}'. Ensure packaged builds include this resource.".format(
+                font_path
+            )
+        )
+        font_id = -1
+    else:
+        font_id = QFontDatabase.addApplicationFont(str(font_path))
+
     if font_id == -1:
         print(f"Warning: Could not load font '{font_path}'. Falling back to default.")
         setattr(app, "_custom_font_family", "Arial")
