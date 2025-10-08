@@ -1704,6 +1704,27 @@ class CullingWidget(QWidget):
     def eventFilter(self, obj, ev: QEvent):
         if ev.type() in (QEvent.Type.KeyPress, QEvent.Type.Wheel, QEvent.Type.MouseButtonPress):
             self._note_user_input()
+
+        capture_widget = None
+        key_sequence_cls = globals().get("KeySequenceEdit")
+        if key_sequence_cls is not None:
+            capture_widget = key_sequence_cls.active_capture_widget()
+        capture_active = capture_widget is not None
+
+        if capture_active and ev.type() in (QEvent.Type.Shortcut, QEvent.Type.ShortcutOverride):
+            try:
+                ev.accept()
+            except Exception:
+                pass
+            return True
+
+        if ev.type() == QEvent.Type.KeyPress:
+            if capture_active:
+                return False
+            is_capture_active = getattr(obj, "is_hotkey_capture_active", None)
+            if callable(is_capture_active) and is_capture_active():
+                return False
+
         if ev.type() == QEvent.Type.KeyPress and not ev.isAutoRepeat():
             key_sequence = QKeySequence(ev.keyCombination())
             portable = key_sequence.toString(QKeySequence.PortableText)
@@ -1753,20 +1774,34 @@ class CullingWidget(QWidget):
                 restored = True
         return restored
 
-    def _flush_queue(self, preserve_metadata: bool = True):
+    def _flush_queue(self, preserve_metadata: bool = True, preserve_keys: Optional[Set[Tuple]] = None):
         flushed = 0
         preserved: List[Tuple] = []
+        preserved_plan = 0
+        preserved_metadata = 0
         restores = 0
+        preserve_set = set(preserve_keys) if preserve_keys is not None else None
+        with self._pending_lock:
+            pending_before = len(self._pending_tasks)
         try:
             while True:
                 item = self._taskq.get_nowait()
                 _, _, fn, args = item
                 is_save_task = self._is_metadata_save_task(fn, args)
-                if preserve_metadata and is_save_task:
+                task_key = getattr(fn, "_srp_task_key", None)
+                keep_for_plan = preserve_set is not None and task_key in preserve_set
+                if keep_for_plan or (preserve_metadata and is_save_task):
                     preserved.append(item)
+                    if keep_for_plan:
+                        preserved_plan += 1
+                    if preserve_metadata and is_save_task:
+                        preserved_metadata += 1
                 else:
                     if is_save_task and self._restore_cancelled_save_task(args):
                         restores += 1
+                    if task_key is not None:
+                        with self._pending_lock:
+                            self._pending_tasks.discard(task_key)
                     flushed += 1
                 try:
                     self._taskq.task_done()
@@ -1776,11 +1811,18 @@ class CullingWidget(QWidget):
             pass
         for item in preserved:
             self._taskq.put(item)
-        with self._pending_lock:
-            p = len(self._pending_tasks); self._pending_tasks.clear()
+        if preserve_set is None:
+            cleared_pending = pending_before
+            with self._pending_lock:
+                self._pending_tasks.clear()
+        else:
+            with self._pending_lock:
+                pending_after = len(self._pending_tasks)
+            cleared_pending = max(0, pending_before - pending_after)
         _plog(
-            f"flush queue: removed={flushed}, preserved_saves={len(preserved)}, "
-            f"restored={restores}, cleared_pending={p}"
+            f"flush queue: removed={flushed}, preserved_plan={preserved_plan}, "
+            f"preserved_metadata={preserved_metadata}, restored={restores}, "
+            f"cleared_pending={cleared_pending}"
         )
         
     def _update_selected_badge_fast(self):
@@ -1909,6 +1951,8 @@ class CullingWidget(QWidget):
             finally:
                 with self._pending_lock:
                     self._pending_tasks.discard(key)
+        setattr(_wrap, "_srp_task_key", key)
+        setattr(_wrap, "_srp_task_origin", fn)
         self._post_task(priority, _wrap, *args)
 
     def _enqueue_load(self, path: str, kind: str, priority: int):
@@ -2304,11 +2348,12 @@ class CullingWidget(QWidget):
         cur = self._current()
         if cur and cur.path == path:
             self.view.set_selected(current_selected)
-            self._update_filmstrip()
-        else:
-            self.filmstrip.update()
-
+            
+        self._update_filmstrip()
         self._update_selected_badge_fast()
+
+        if selected_changed:
+            self.autosave_timer.start(1500)
         
     def _refresh_statusbar(self):
         if self.status_restore_timer.isActive(): return
@@ -2452,20 +2497,52 @@ class CullingWidget(QWidget):
 
     def _schedule_heavy_load(self):
         _plog(f"User input settled. Scheduling heavy load for index {self.idx}.")
-        self._flush_queue(); self._schedule_loading_plan_fire()
+        self._schedule_loading_plan_fire()
+
+    def _apply_task_plan(self, plan: List[Tuple[int, Tuple, Callable[..., None], Tuple]]):
+        dedup: Dict[Tuple, Tuple[int, Callable[..., None], Tuple]] = {}
+        for priority, key, fn, args in plan:
+            prev = dedup.get(key)
+            if prev is None or priority < prev[0]:
+                dedup[key] = (priority, fn, args)
+        preserve_keys = set(dedup.keys())
+        self._flush_queue(preserve_keys=preserve_keys)
+        ordered = sorted(dedup.items(), key=lambda item: item[1][0])
+        for key, (priority, fn, args) in ordered:
+            self._enqueue(priority, key, fn, *args)
 
     def _schedule_loading_plan_fire(self):
         cur = self._current()
-        if not cur: return
+        if not cur:
+            self._flush_queue(preserve_keys=set())
+            return
         cur_path = cur.path; total = len(self.catalog.photos)
 
         area = self.view.contentsRect(); dpr = self.view.devicePixelRatioF()
         target_size = QSize(int(area.width() * dpr), int(area.height() * dpr))
 
+        plan: List[Tuple[int, Tuple, Callable[..., None], Tuple]] = []
+
+        def plan_load(path: str, kind: str, priority: int):
+            plan.append((priority, (path, kind), self._worker_entry, (path, kind)))
+
+        def plan_xmp(path: str, priority: int):
+            plan.append((priority, (path, 'xmp'), self._worker_entry, (path, 'xmp')))
+
+        def plan_resized(path: str, size: QSize, priority: int):
+            plan.append(
+                (
+                    priority,
+                    (path, 'resized_pixmap', size.width(), size.height()),
+                    self._worker_build_resized_pixmap,
+                    (path, size),
+                )
+            )
+
         if self._get_pil_half_cached(cur_path) is None:
-            self._enqueue_load(cur_path, 'half', -100)
-        
-        self._enqueue_xmp(cur_path, -95)
+            plan_load(cur_path, 'half', -100)
+
+        plan_xmp(cur_path, -95)
 
         self._start_full_delay_timer(cur_path)
 
@@ -2480,11 +2557,11 @@ class CullingWidget(QWidget):
 
         HALF_BASE = -60
         for pth, d in neighbors:
-            self._enqueue_xmp(pth, HALF_BASE + d * 2)
+            plan_xmp(pth, HALF_BASE + d * 2)
             if self._get_pil_half_cached(pth) is not None:
-                self._enqueue_build_resized_pixmap(pth, target_size, HALF_BASE + d * 2 + 1)
+                plan_resized(pth, target_size, HALF_BASE + d * 2 + 1)
             else:
-                self._enqueue_load(pth, 'half', HALF_BASE + d * 2)
+                plan_load(pth, 'half', HALF_BASE + d * 2)
 
         neighbors_full: list[tuple[str,int]] = []
         for d in range(1, 5 + 1):
@@ -2498,7 +2575,9 @@ class CullingWidget(QWidget):
         FULL_BASE = -40
         for pth, d in neighbors_full:
             if self._get_pil_full_cached(pth) is None:
-                self._enqueue_load(pth, 'full', FULL_BASE + d)
+                plan_load(pth, 'full', FULL_BASE + d)
+
+        self._apply_task_plan(plan)
 
     def _start_full_delay_timer(self, path: str):
         if self._get_pil_full_cached(path) is not None: return
@@ -2520,14 +2599,78 @@ class CullingWidget(QWidget):
             self._enqueue_xmp(photo.path, priority=100 + i)
 
     def _load_selections(self):
+        total = len(self.catalog.photos)
+        if total == 0:
+            return
+
+        if os.path.exists(self.selections_path):
+            try:
+                with open(self.selections_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                selected_set = set(data.get('selected_paths', []))
+                for p in self.catalog.photos:
+                    p.selected = (p.path in selected_set)
+            except Exception:
+                pass
+            finally:
+                self._update_selected_badge_fast()
+            return
+
+        if exiv2 is None:
+            self._update_selected_badge_fast()
+            return
+
+        app = QApplication.instance()
+        progress = None
+        if app:
+            parent = app.activeWindow()
+            progress = QProgressDialog("Reading XMP sidecars…", "", 0, total, parent)
+            progress.setCancelButton(None)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            progress.show()
+            QApplication.processEvents()
+
+        selected_paths: List[str] = []
+        for idx, photo in enumerate(self.catalog.photos, start=1):
+            data = read_xmp_sidecar(photo.path)
+            rating_val = data.get('rating') if data else None
+            label_val = data.get('color_label') if data else None
+            selected_val = data.get('selected') if data else None
+
+            with photo.lock:
+                if data:
+                    photo.xmp_loaded = True
+                if rating_val is not None:
+                    photo.rating = rating_val
+                if label_val is not None:
+                    photo.color_label = label_val
+                if selected_val is not None:
+                    photo.selected = selected_val
+
+            if photo.selected:
+                selected_paths.append(photo.path)
+
+            if progress:
+                progress.setValue(idx)
+                QApplication.processEvents()
+
+        if progress:
+            progress.close()
+
+        self._update_selected_badge_fast()
+
+        data = {
+            'root': self.catalog.root,
+            'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'selected_paths': selected_paths,
+        }
         try:
-            with open(self.selections_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            selected_set = set(data.get('selected_paths', []))
-            for p in self.catalog.photos:
-                p.selected = (p.path in selected_set)
-        except Exception:
-            pass
+            with open(self.selections_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Error creating selections.json: {e}")
 
     def save_all_dirty_files(self, wait: bool = False):
         """메모리에서 변경된 모든 사항(selections.json 및 XMP)을 파일에 저장합니다."""
@@ -2635,18 +2778,45 @@ class CullingWidget(QWidget):
 
               
 class KeySequenceEdit(QLineEdit):
+    _active_capture_widget: Optional['KeySequenceEdit'] = None
+
     def __init__(self, key_sequence_str: str, parent=None):
         super().__init__(key_sequence_str, parent)
         self.setPlaceholderText("Click to set a new shortcut")
         self._is_capturing = False
 
+    @classmethod
+    def active_capture_widget(cls) -> Optional['KeySequenceEdit']:
+        widget = cls._active_capture_widget
+        if widget is not None and widget.is_hotkey_capture_active():
+            return widget
+        return None
+
+    def is_hotkey_capture_active(self) -> bool:
+        return self._is_capturing
+
     def _enter_capture_mode(self):
+        if self._is_capturing:
+            return
         self.setText("")
         self.setPlaceholderText("Press a key or key combination...")
         self._is_capturing = True
+        KeySequenceEdit._active_capture_widget = self
+        try:
+            self.grabKeyboard()
+        except Exception:
+            pass
 
     def _exit_capture_mode(self):
+        if not self._is_capturing:
+            return
         self._is_capturing = False
+        if KeySequenceEdit._active_capture_widget is self:
+            KeySequenceEdit._active_capture_widget = None
+        try:
+            self.releaseKeyboard()
+        except Exception:
+            pass
         self.setPlaceholderText("Click to set a new shortcut")
 
     def mousePressEvent(self, event: QEvent):
@@ -2671,6 +2841,17 @@ class KeySequenceEdit(QLineEdit):
         text = key_sequence.toString(QKeySequence.NativeText)
 
         if not text:
+            # Some platforms fail to produce a key combination string for
+            # plain number keys (e.g. keypad digits). Try again with just the
+            # key code and finally fall back to the text representation so
+            # that numeric shortcuts can be captured reliably.
+            fallback_sequence = QKeySequence(event.key())
+            text = fallback_sequence.toString(QKeySequence.NativeText)
+
+        if not text:
+            text = event.text() or ""
+
+        if not text:
             return
 
         current_text = self.text()
@@ -2679,6 +2860,7 @@ class KeySequenceEdit(QLineEdit):
         else:
             self.setText(text)
 
+        self._exit_capture_mode()
         event.accept()
 
 class SettingsDialog(QDialog):
