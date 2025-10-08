@@ -1509,6 +1509,27 @@ class CullingWidget(QWidget):
     def eventFilter(self, obj, ev: QEvent):
         if ev.type() in (QEvent.Type.KeyPress, QEvent.Type.Wheel, QEvent.Type.MouseButtonPress):
             self._note_user_input()
+
+        capture_widget = None
+        key_sequence_cls = globals().get("KeySequenceEdit")
+        if key_sequence_cls is not None:
+            capture_widget = key_sequence_cls.active_capture_widget()
+        capture_active = capture_widget is not None
+
+        if capture_active and ev.type() in (QEvent.Type.Shortcut, QEvent.Type.ShortcutOverride):
+            try:
+                ev.accept()
+            except Exception:
+                pass
+            return True
+
+        if ev.type() == QEvent.Type.KeyPress:
+            if capture_active:
+                return False
+            is_capture_active = getattr(obj, "is_hotkey_capture_active", None)
+            if callable(is_capture_active) and is_capture_active():
+                return False
+
         if ev.type() == QEvent.Type.KeyPress and not ev.isAutoRepeat():
             key_sequence = QKeySequence(ev.keyCombination())
             portable = key_sequence.toString(QKeySequence.PortableText)
@@ -2435,18 +2456,45 @@ class CullingWidget(QWidget):
 
               
 class KeySequenceEdit(QLineEdit):
+    _active_capture_widget: Optional['KeySequenceEdit'] = None
+
     def __init__(self, key_sequence_str: str, parent=None):
         super().__init__(key_sequence_str, parent)
         self.setPlaceholderText("Click to set a new shortcut")
         self._is_capturing = False
 
+    @classmethod
+    def active_capture_widget(cls) -> Optional['KeySequenceEdit']:
+        widget = cls._active_capture_widget
+        if widget is not None and widget.is_hotkey_capture_active():
+            return widget
+        return None
+
+    def is_hotkey_capture_active(self) -> bool:
+        return self._is_capturing
+
     def _enter_capture_mode(self):
+        if self._is_capturing:
+            return
         self.setText("")
         self.setPlaceholderText("Press a key or key combination...")
         self._is_capturing = True
+        KeySequenceEdit._active_capture_widget = self
+        try:
+            self.grabKeyboard()
+        except Exception:
+            pass
 
     def _exit_capture_mode(self):
+        if not self._is_capturing:
+            return
         self._is_capturing = False
+        if KeySequenceEdit._active_capture_widget is self:
+            KeySequenceEdit._active_capture_widget = None
+        try:
+            self.releaseKeyboard()
+        except Exception:
+            pass
         self.setPlaceholderText("Click to set a new shortcut")
 
     def mousePressEvent(self, event: QEvent):
@@ -2471,6 +2519,17 @@ class KeySequenceEdit(QLineEdit):
         text = key_sequence.toString(QKeySequence.NativeText)
 
         if not text:
+            # Some platforms fail to produce a key combination string for
+            # plain number keys (e.g. keypad digits). Try again with just the
+            # key code and finally fall back to the text representation so
+            # that numeric shortcuts can be captured reliably.
+            fallback_sequence = QKeySequence(event.key())
+            text = fallback_sequence.toString(QKeySequence.NativeText)
+
+        if not text:
+            text = event.text() or ""
+
+        if not text:
             return
 
         current_text = self.text()
@@ -2479,6 +2538,7 @@ class KeySequenceEdit(QLineEdit):
         else:
             self.setText(text)
 
+        self._exit_capture_mode()
         event.accept()
 
 class SettingsDialog(QDialog):
