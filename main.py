@@ -2,7 +2,7 @@
 
 import os, sys, io, json, time, shutil, argparse
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set, Callable
 from datetime import datetime
 import threading
 from collections import OrderedDict
@@ -1579,20 +1579,34 @@ class CullingWidget(QWidget):
                 restored = True
         return restored
 
-    def _flush_queue(self, preserve_metadata: bool = True):
+    def _flush_queue(self, preserve_metadata: bool = True, preserve_keys: Optional[Set[Tuple]] = None):
         flushed = 0
         preserved: List[Tuple] = []
+        preserved_plan = 0
+        preserved_metadata = 0
         restores = 0
+        preserve_set = set(preserve_keys) if preserve_keys is not None else None
+        with self._pending_lock:
+            pending_before = len(self._pending_tasks)
         try:
             while True:
                 item = self._taskq.get_nowait()
                 _, _, fn, args = item
                 is_save_task = self._is_metadata_save_task(fn, args)
-                if preserve_metadata and is_save_task:
+                task_key = getattr(fn, "_srp_task_key", None)
+                keep_for_plan = preserve_set is not None and task_key in preserve_set
+                if keep_for_plan or (preserve_metadata and is_save_task):
                     preserved.append(item)
+                    if keep_for_plan:
+                        preserved_plan += 1
+                    if preserve_metadata and is_save_task:
+                        preserved_metadata += 1
                 else:
                     if is_save_task and self._restore_cancelled_save_task(args):
                         restores += 1
+                    if task_key is not None:
+                        with self._pending_lock:
+                            self._pending_tasks.discard(task_key)
                     flushed += 1
                 try:
                     self._taskq.task_done()
@@ -1602,11 +1616,18 @@ class CullingWidget(QWidget):
             pass
         for item in preserved:
             self._taskq.put(item)
-        with self._pending_lock:
-            p = len(self._pending_tasks); self._pending_tasks.clear()
+        if preserve_set is None:
+            cleared_pending = pending_before
+            with self._pending_lock:
+                self._pending_tasks.clear()
+        else:
+            with self._pending_lock:
+                pending_after = len(self._pending_tasks)
+            cleared_pending = max(0, pending_before - pending_after)
         _plog(
-            f"flush queue: removed={flushed}, preserved_saves={len(preserved)}, "
-            f"restored={restores}, cleared_pending={p}"
+            f"flush queue: removed={flushed}, preserved_plan={preserved_plan}, "
+            f"preserved_metadata={preserved_metadata}, restored={restores}, "
+            f"cleared_pending={cleared_pending}"
         )
         
     def _update_selected_badge_fast(self):
@@ -1735,6 +1756,8 @@ class CullingWidget(QWidget):
             finally:
                 with self._pending_lock:
                     self._pending_tasks.discard(key)
+        setattr(_wrap, "_srp_task_key", key)
+        setattr(_wrap, "_srp_task_origin", fn)
         self._post_task(priority, _wrap, *args)
 
     def _enqueue_load(self, path: str, kind: str, priority: int):
@@ -2271,20 +2294,52 @@ class CullingWidget(QWidget):
 
     def _schedule_heavy_load(self):
         _plog(f"User input settled. Scheduling heavy load for index {self.idx}.")
-        self._flush_queue(); self._schedule_loading_plan_fire()
+        self._schedule_loading_plan_fire()
+
+    def _apply_task_plan(self, plan: List[Tuple[int, Tuple, Callable[..., None], Tuple]]):
+        dedup: Dict[Tuple, Tuple[int, Callable[..., None], Tuple]] = {}
+        for priority, key, fn, args in plan:
+            prev = dedup.get(key)
+            if prev is None or priority < prev[0]:
+                dedup[key] = (priority, fn, args)
+        preserve_keys = set(dedup.keys())
+        self._flush_queue(preserve_keys=preserve_keys)
+        ordered = sorted(dedup.items(), key=lambda item: item[1][0])
+        for key, (priority, fn, args) in ordered:
+            self._enqueue(priority, key, fn, *args)
 
     def _schedule_loading_plan_fire(self):
         cur = self._current()
-        if not cur: return
+        if not cur:
+            self._flush_queue(preserve_keys=set())
+            return
         cur_path = cur.path; total = len(self.catalog.photos)
 
         area = self.view.contentsRect(); dpr = self.view.devicePixelRatioF()
         target_size = QSize(int(area.width() * dpr), int(area.height() * dpr))
 
+        plan: List[Tuple[int, Tuple, Callable[..., None], Tuple]] = []
+
+        def plan_load(path: str, kind: str, priority: int):
+            plan.append((priority, (path, kind), self._worker_entry, (path, kind)))
+
+        def plan_xmp(path: str, priority: int):
+            plan.append((priority, (path, 'xmp'), self._worker_entry, (path, 'xmp')))
+
+        def plan_resized(path: str, size: QSize, priority: int):
+            plan.append(
+                (
+                    priority,
+                    (path, 'resized_pixmap', size.width(), size.height()),
+                    self._worker_build_resized_pixmap,
+                    (path, size),
+                )
+            )
+
         if self._get_pil_half_cached(cur_path) is None:
-            self._enqueue_load(cur_path, 'half', -100)
-        
-        self._enqueue_xmp(cur_path, -95)
+            plan_load(cur_path, 'half', -100)
+
+        plan_xmp(cur_path, -95)
 
         self._start_full_delay_timer(cur_path)
 
@@ -2299,11 +2354,11 @@ class CullingWidget(QWidget):
 
         HALF_BASE = -60
         for pth, d in neighbors:
-            self._enqueue_xmp(pth, HALF_BASE + d * 2)
+            plan_xmp(pth, HALF_BASE + d * 2)
             if self._get_pil_half_cached(pth) is not None:
-                self._enqueue_build_resized_pixmap(pth, target_size, HALF_BASE + d * 2 + 1)
+                plan_resized(pth, target_size, HALF_BASE + d * 2 + 1)
             else:
-                self._enqueue_load(pth, 'half', HALF_BASE + d * 2)
+                plan_load(pth, 'half', HALF_BASE + d * 2)
 
         neighbors_full: list[tuple[str,int]] = []
         for d in range(1, 5 + 1):
@@ -2317,7 +2372,9 @@ class CullingWidget(QWidget):
         FULL_BASE = -40
         for pth, d in neighbors_full:
             if self._get_pil_full_cached(pth) is None:
-                self._enqueue_load(pth, 'full', FULL_BASE + d)
+                plan_load(pth, 'full', FULL_BASE + d)
+
+        self._apply_task_plan(plan)
 
     def _start_full_delay_timer(self, path: str):
         if self._get_pil_full_cached(path) is not None: return
