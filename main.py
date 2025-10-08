@@ -77,6 +77,7 @@ DEFAULT_HOTKEYS = OrderedDict([
     ('unselect', 'X'),
     ('toggle_zebra', 'Q'),
     ('toggle_hdr', 'E'),
+    ('toggle_selected_view', 'F'),
     ('rate_1', '1'),
     ('rate_2', '2'),
     ('rate_3', '3'),
@@ -1475,12 +1476,14 @@ class CullingWidget(QWidget):
         self.meta_left = QLabel(); self.meta_left.setObjectName('metaLeft')
         self.meta_left.setText("")
 
+        self.badge_filter = QLabel("All Photos"); self.badge_filter.setObjectName("badgeGhost")
         self.badge_selected = QLabel("Selected: 0"); self.badge_selected.setObjectName("badge")
         self.badge_zebra =   QLabel("Zebra OFF");    self.badge_zebra.setObjectName("badgeGhost")
         self.badge_hdr   =   QLabel("HDR OFF");      self.badge_hdr.setObjectName("badgeGhost")
 
         mb.addWidget(self.meta_left, 1)
         mb.addSpacing(8)
+        mb.addWidget(self.badge_filter, 0, Qt.AlignRight)
         mb.addWidget(self.badge_selected, 0, Qt.AlignRight)
         mb.addWidget(self.badge_zebra,   0, Qt.AlignRight)
         mb.addWidget(self.badge_hdr,     0, Qt.AlignRight)
@@ -1502,6 +1505,7 @@ class CullingWidget(QWidget):
 
         self.catalog = Catalog(root)
         self.idx = 0
+        self.selected_view_only = False
 
         self.pil_full_cache: OrderedDict[str, Image.Image] = OrderedDict()
         self.pil_half_cache: OrderedDict[str, Image.Image] = OrderedDict()
@@ -1577,6 +1581,7 @@ class CullingWidget(QWidget):
         self.update_settings()
         QApplication.instance().installEventFilter(self)
 
+        self._update_filter_badge()
         self._show_current()
         self._schedule_heavy_load()
 
@@ -1643,6 +1648,7 @@ class CullingWidget(QWidget):
             'help': self.show_help,
             'toggle_zebra': self.toggle_zebra,
             'toggle_hdr': self.toggle_hdr,
+            'toggle_selected_view': self.toggle_selected_view,
         }
         for name, callback in action_map.items():
             action = QAction(self)
@@ -1681,7 +1687,7 @@ class CullingWidget(QWidget):
         relevant_names = [
             *(f'rate_{i}' for i in range(1, 6)),
             'label_red', 'label_yellow', 'label_green', 'label_blue', 'label_purple',
-            'toggle_zebra', 'toggle_hdr',
+            'toggle_zebra', 'toggle_hdr', 'toggle_selected_view',
         ]
 
         bindings: Dict[str, List[QAction]] = {}
@@ -1700,6 +1706,55 @@ class CullingWidget(QWidget):
                 bindings.setdefault(text, []).append(action)
 
         self._hotkey_bindings = bindings
+
+    def _update_filter_badge(self):
+        if getattr(self, 'badge_filter', None) is None:
+            return
+        if self.selected_view_only:
+            self.badge_filter.setText("Selected Only")
+            self.badge_filter.setObjectName("badge")
+        else:
+            self.badge_filter.setText("All Photos")
+            self.badge_filter.setObjectName("badgeGhost")
+        self.badge_filter.style().unpolish(self.badge_filter); self.badge_filter.style().polish(self.badge_filter)
+
+    def _active_indices(self) -> List[int]:
+        if not self.catalog.photos:
+            return []
+        if not self.selected_view_only:
+            return list(range(len(self.catalog.photos)))
+        return [i for i, ph in enumerate(self.catalog.photos) if ph.selected]
+
+    def _current_position(self, indices: Optional[List[int]] = None) -> int:
+        indices = indices if indices is not None else self._active_indices()
+        if not indices:
+            return -1
+        try:
+            return indices.index(self.idx)
+        except ValueError:
+            return -1
+
+    def _update_view_after_selection_change(self, reference_index: Optional[int] = None):
+        if not self.selected_view_only:
+            return
+
+        indices = [i for i, ph in enumerate(self.catalog.photos) if ph.selected]
+        if not indices:
+            self.selected_view_only = False
+            self._update_filter_badge()
+            self._show_toast("No selected photos - showing all photos")
+            if self.catalog.photos:
+                self.idx = max(0, min(self.idx, len(self.catalog.photos) - 1))
+            return
+
+        if self.idx in indices:
+            return
+
+        ref = reference_index if reference_index is not None else self.idx
+        next_idx = next((i for i in indices if i >= ref), None)
+        if next_idx is None:
+            next_idx = indices[-1]
+        self.idx = next_idx
 
     def eventFilter(self, obj, ev: QEvent):
         if ev.type() in (QEvent.Type.KeyPress, QEvent.Type.Wheel, QEvent.Type.MouseButtonPress):
@@ -2144,6 +2199,7 @@ class CullingWidget(QWidget):
             f"Mouse: Wheel to zoom, Drag to pan (when zoomed)\n"
             f"Select: {hotkeys.get('toggle_select','')} (Toggle), {hotkeys.get('unselect','')} (Unselect)\n"
             f"View Modes: {hotkeys.get('toggle_zebra','')} (Toggle Zebra/Histogram), {hotkeys.get('toggle_hdr','')} (Toggle Faux HDR Preview)\n"
+            f"Filters: {hotkeys.get('toggle_selected_view','')} (Toggle Selected Only View)\n"
             f"Save/Export: {hotkeys.get('save','')} (Save selections.json), {hotkeys.get('export','')} (Export)\n"
             f"Exit: {hotkeys.get('quit','')}\n\n"
             f"{xmp_hotkeys}"
@@ -2154,12 +2210,30 @@ class CullingWidget(QWidget):
         return self.catalog.photos[self.idx]
 
     def next_photo(self):
-        if self.idx + 1 < len(self.catalog.photos):
-            self.idx += 1; self._show_current(); self._heavy_load_scheduler.start()
+        indices = self._active_indices()
+        if not indices:
+            return
+        pos = self._current_position(indices)
+        if pos < 0:
+            self.idx = indices[0]
+            self._show_current(); self._heavy_load_scheduler.start()
+            return
+        if pos + 1 < len(indices):
+            self.idx = indices[pos + 1]
+            self._show_current(); self._heavy_load_scheduler.start()
 
     def prev_photo(self):
-        if self.idx > 0:
-            self.idx -= 1; self._show_current(); self._heavy_load_scheduler.start()
+        indices = self._active_indices()
+        if not indices:
+            return
+        pos = self._current_position(indices)
+        if pos < 0:
+            self.idx = indices[0]
+            self._show_current(); self._heavy_load_scheduler.start()
+            return
+        if pos > 0:
+            self.idx = indices[pos - 1]
+            self._show_current(); self._heavy_load_scheduler.start()
 
     def _load_xmp_if_needed(self, photo: Photo):
         """Schedule a read from disk if the photo's XMP data is not loaded yet."""
@@ -2172,22 +2246,26 @@ class CullingWidget(QWidget):
     def toggle_select(self):
         p = self._current()
         if not p: return
-        
-        self._load_xmp_if_needed(p) 
-        p.update_xmp({'selected': not p.selected}) 
-        
+
+        self._load_xmp_if_needed(p)
+        current_index = self.idx
+        p.update_xmp({'selected': not p.selected})
+
         self._update_selected_badge_fast()
-        self._show_current() 
-        self.autosave_timer.start(1500) 
+        self._update_view_after_selection_change(current_index)
+        self._show_current()
+        self.autosave_timer.start(1500)
 
     def unselect_current(self):
         p = self._current()
         if not p: return
         if p.selected:
             self._load_xmp_if_needed(p)
+            current_index = self.idx
             p.update_xmp({'selected': False})
-            
+
             self._update_selected_badge_fast()
+            self._update_view_after_selection_change(current_index)
             self._show_current()
             self.autosave_timer.start(1500)
 
@@ -2233,6 +2311,22 @@ class CullingWidget(QWidget):
         self.badge_hdr.style().unpolish(self.badge_hdr); self.badge_hdr.style().polish(self.badge_hdr)
         self._show_temporary_status(f"Faux HDR Preview: {'ON' if self.hdr_toggled else 'OFF'}", 1000)
 
+    def toggle_selected_view(self):
+        self.selected_view_only = not self.selected_view_only
+        indices = self._active_indices()
+        if self.selected_view_only and not indices:
+            self.selected_view_only = False
+            self._show_toast("No selected photos to display")
+            self._update_filter_badge()
+            return
+        if indices:
+            if self.idx not in indices:
+                self.idx = indices[0]
+        self._update_filter_badge()
+        self._show_current()
+        self._heavy_load_scheduler.start()
+        self._show_toast("Showing selected photos only" if self.selected_view_only else "Showing all photos")
+
     def _show_temporary_status(self, message: str, timeout: int = 1000):
         self.status_restore_timer.stop()
         self.status_message.emit(message, 0)
@@ -2275,21 +2369,34 @@ class CullingWidget(QWidget):
 
 
     def _update_filmstrip(self, k_forward: int = 5, k_backward: int = 5):
-        if not self.catalog.photos: self.filmstrip.set_items([]); return
+        indices = self._active_indices()
+        if not indices:
+            self.filmstrip.set_items([])
+            return
+        if self.idx not in indices:
+            self.idx = indices[0]
+        current_pos = self._current_position(indices)
+        if current_pos < 0:
+            current_pos = 0
+        if not self.catalog.photos:
+            self.filmstrip.set_items([])
+            return
         items = []
-        start_back = max(0, self.idx - k_backward)
-        for i in range(start_back, self.idx):
-            ph = self.catalog.photos[i]
+        start_back = max(0, current_pos - k_backward)
+        for pos in range(start_back, current_pos):
+            idx = indices[pos]
+            ph = self.catalog.photos[idx]
             items.append({'path': ph.path, 'selected': ph.selected, 'current': False, 'rating': ph.rating, 'color_label': ph.color_label})
-        
+
         phc = self.catalog.photos[self.idx]
         items.append({'path': phc.path, 'selected': phc.selected, 'current': True, 'rating': phc.rating, 'color_label': phc.color_label})
-        
-        end_forward = min(len(self.catalog.photos), self.idx + 1 + k_forward)
-        for i in range(self.idx + 1, end_forward):
-            ph = self.catalog.photos[i]
+
+        end_forward = min(len(indices), current_pos + 1 + k_forward)
+        for pos in range(current_pos + 1, end_forward):
+            idx = indices[pos]
+            ph = self.catalog.photos[idx]
             items.append({'path': ph.path, 'selected': ph.selected, 'current': False, 'rating': ph.rating, 'color_label': ph.color_label})
-        
+
         self.filmstrip.set_items(items)
 
         target_h = max(32, self.filmstrip.height() - 0)
@@ -2345,10 +2452,13 @@ class CullingWidget(QWidget):
 
             current_selected = photo.selected
 
+        photo_index = self.catalog.photos.index(photo)
+        self._update_view_after_selection_change(photo_index)
+
         cur = self._current()
         if cur and cur.path == path:
             self.view.set_selected(current_selected)
-            
+
         self._update_filmstrip()
         self._update_selected_badge_fast()
 
@@ -2359,27 +2469,47 @@ class CullingWidget(QWidget):
         if self.status_restore_timer.isActive(): return
         p = self._current()
         if not p: return
-        total = len(self.catalog.photos)
+        indices = self._active_indices()
+        total = len(indices) if indices else len(self.catalog.photos)
+        pos = self._current_position(indices)
+        current_num = (pos + 1) if pos >= 0 else (self.idx + 1)
         total_sel = sum(1 for x in self.catalog.photos if x.selected)
         self.badge_selected.setText(f"Selected: {total_sel}")
-        msg = f"[{self.idx+1}/{total}]  Selected: {total_sel}  {os.path.basename(p.path)}  |  workers: {self._num_workers}"
+        view_scope = "sel" if self.selected_view_only else "all"
+        msg = f"[{current_num}/{total} {view_scope}]  Selected: {total_sel}  {os.path.basename(p.path)}  |  workers: {self._num_workers}"
         self.status_message.emit(msg, 0)
 
     def _show_current(self):
+        self._update_view_after_selection_change(self.idx)
+        indices = self._active_indices()
+        if not indices:
+            self.meta_left.setText("")
+            self.view.setText("No images")
+            self.filmstrip.set_items([])
+            self._refresh_statusbar()
+            return
+        if self.idx not in indices:
+            self.idx = indices[0]
         p = self._current()
         if not p:
             self.meta_left.setText("")
-            self.view.setText("No images"); return
+            self.view.setText("No images")
+            self.filmstrip.set_items([])
+            self._refresh_statusbar()
+            return
 
-        self._load_xmp_if_needed(p) 
+        self._load_xmp_if_needed(p)
 
-        total = len(self.catalog.photos)
-        visible_range = range(max(0, self.idx - 5), min(total, self.idx + 6))  
-        for i in visible_range:
-            if i<0: break
-            visiblePhoto = self.catalog.photos[i]
+        pos = self._current_position(indices)
+        if pos < 0:
+            pos = indices.index(self.idx) if self.idx in indices else 0
+        start = max(0, pos - 5)
+        end = min(len(indices), pos + 6)
+        for i in range(start, end):
+            photo_index = indices[i]
+            visiblePhoto = self.catalog.photos[photo_index]
             self._load_xmp_if_needed(visiblePhoto)
-        
+
         self.view.set_selected(p.selected)
         self._update_metadata(p.path)
         self._refresh_statusbar()
@@ -2904,6 +3034,7 @@ class SettingsDialog(QDialog):
             'unselect': 'Unselect Image:',
             'toggle_zebra': 'Toggle Zebra/Histogram:',
             'toggle_hdr': 'Toggle Faux HDR Preview:',
+            'toggle_selected_view': 'Show Selected Only:',
             'rate_1': '1★ Rating:',
             'rate_2': '2★ Rating:',
             'rate_3': '3★ Rating:',
