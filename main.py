@@ -476,7 +476,7 @@ class Photo:
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def update_xmp(self, data: Dict):
-        """메모리 상태를 변경하고 dirty 플래그를 설정합니다."""
+        """Update the in-memory state and set the dirty flag."""
         with self.lock:
             changed = False
             if 'rating' in data and self.rating != data['rating']:
@@ -1583,10 +1583,10 @@ class CullingWidget(QWidget):
         if not self.catalog.photos:
             QMessageBox.information(self, "Information", "No supported photo files found.")
         elif exiv2 is None:
-            QMessageBox.warning(self, "XMP 기능 비활성화",
-                                "py3exiv2 라이브러리를 찾을 수 없습니다.\n"
-                                "등급 및 색상 라벨 기능이 비활성화됩니다.\n"
-                                "`pip install py3exiv2`를 실행하여 설치해주세요.")
+            QMessageBox.warning(self, "XMP Features Disabled",
+                                "Could not find the py3exiv2 library.\n"
+                                "Rating and color label features are disabled.\n"
+                                "Please run `pip install py3exiv2` to install it.")
 
         self.setStyleSheet("""
             QWidget#card {
@@ -2162,7 +2162,7 @@ class CullingWidget(QWidget):
             self.idx -= 1; self._show_current(); self._heavy_load_scheduler.start()
 
     def _load_xmp_if_needed(self, photo: Photo):
-        """Photo 객체의 XMP 데이터를 아직 읽지 않았다면 파일에서 읽기 작업을 예약합니다."""
+        """Schedule a read from disk if the photo's XMP data is not loaded yet."""
         with photo.lock:
             if photo.xmp_loaded:
                 return
@@ -2673,7 +2673,7 @@ class CullingWidget(QWidget):
             print(f"Error creating selections.json: {e}")
 
     def save_all_dirty_files(self, wait: bool = False):
-        """메모리에서 변경된 모든 사항(selections.json 및 XMP)을 파일에 저장합니다."""
+        """Save all in-memory changes (selections.json and XMP) to disk."""
         self.autosave_timer.stop()
 
         selected_paths = [p.path for p in self.catalog.photos if p.selected]
@@ -3576,7 +3576,7 @@ class AppWindow(QMainWindow):
             on_error=on_error,
             on_cancel=on_cancel,
             finalize=finalize,
-            finalize_message="세션 정리 중...",
+            finalize_message="Cleaning up session...",
         )
     def _show_toast(self, text: str, ms: int = 1500):
         if not hasattr(self, "_toast_label"):
