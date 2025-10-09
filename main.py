@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStackedWidget,
     QToolBar, QDialog, QFormLayout, QGridLayout, QSpinBox, QLineEdit, QDialogButtonBox,
     QSizePolicy, QGroupBox, QGraphicsDropShadowEffect, QRadioButton, QSpacerItem,
-    QProgressDialog
+    QProgressDialog, QScrollArea
 )
 
 try:
@@ -96,6 +96,332 @@ DEFAULT_HOTKEYS = OrderedDict([
 ])
 
 _XMP_GLOBAL_LOCK = threading.Lock()
+
+
+class HotkeyDialog(QDialog):
+    def __init__(self, parent: QWidget, hotkeys: Dict[str, str]):
+        super().__init__(parent)
+        self.setObjectName("HotkeyDialog")
+        self.setWindowTitle("Quick Start Guide")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(520)
+        self.setMaximumHeight(640)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.hotkeys = hotkeys
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 28, 28, 24)
+        layout.setSpacing(18)
+
+        title = QLabel("Welcome to Simple Raw Picker", self)
+        title.setObjectName("DialogTitle")
+        title.setAlignment(Qt.AlignCenter)
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Start by opening a folder of RAW files. These quick tips show how to review, pick, and export efficiently.",
+            self,
+        )
+        subtitle.setObjectName("DialogSubtitle")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(6)
+
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(scroll_area, 1)
+
+        content_widget = QWidget(scroll_area)
+        scroll_area.setWidget(content_widget)
+
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(14)
+
+        content_layout.addWidget(self._create_intro_card())
+
+        self._add_section(content_layout, "Navigate the roll", [
+            ("Next photo", ["next"]),
+            ("Previous photo", ["prev"]),
+            ("Toggle selected-only view", ["toggle_selected_view"]),
+        ])
+
+        self._add_section(content_layout, "Pick the keepers", [
+            ("Toggle pick", ["toggle_select"]),
+            ("Export picked photos", ["export"]),
+        ])
+
+        self._add_section(content_layout, "Viewing tools", [
+            ("Toggle zebra / histogram overlay", ["toggle_zebra"]),
+            ("Toggle HDR preview", ["toggle_hdr"]),
+        ])
+
+        content_layout.addWidget(self._create_ratings_card())
+        content_layout.addWidget(self._create_mouse_card())
+
+        content_layout.addStretch(1)
+
+        footer = QLabel("Press F1 any time to reopen this guide.", self)
+        footer.setObjectName("DialogFooter")
+        footer.setAlignment(Qt.AlignCenter)
+        footer.setWordWrap(True)
+        layout.addWidget(footer)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(12)
+        button_row.addStretch(1)
+
+        close_btn = QPushButton("Let's start", self)
+        close_btn.setObjectName("DialogPrimaryButton")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        button_row.addWidget(close_btn, 0, Qt.AlignRight)
+
+        layout.addLayout(button_row)
+
+        self.setStyleSheet("""
+            QDialog#HotkeyDialog {
+                background-color: #202124;
+                border: 1px solid #35383b;
+            }
+            QLabel#DialogTitle {
+                font-size: 18pt;
+                font-weight: 700;
+                color: #f4f4f4;
+            }
+            QLabel#DialogSubtitle {
+                font-size: 11pt;
+                color: #c2c7cc;
+            }
+            QLabel#DialogFooter {
+                color: #9096a0;
+                font-size: 9.5pt;
+            }
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: transparent;
+            }
+            QScrollBar:vertical {
+                background-color: #1b1d20;
+                width: 12px;
+                margin: 6px 0 6px 4px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #59616b;
+                min-height: 40px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #6e7783;
+            }
+            QScrollBar::handle:vertical:pressed {
+                background-color: #8b96a4;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: none;
+                height: 0px;
+            }
+            QWidget#SectionCard {
+                background-color: #2b2d30;
+                border-radius: 14px;
+                border: 1px solid #3a3d40;
+            }
+            QLabel#SectionHeading {
+                font-size: 11pt;
+                font-weight: 600;
+                color: #85d7a3;
+            }
+            QLabel#ShortcutDescription {
+                color: #e5e5e5;
+                font-size: 10.5pt;
+            }
+            QLabel#ShortcutKey {
+                font-size: 10.5pt;
+            }
+            QPushButton#DialogPrimaryButton {
+                background-color: #1b6d35;
+                color: #ffffff;
+                font-weight: 600;
+                border-radius: 9px;
+                padding: 8px 20px;
+            }
+            QPushButton#DialogPrimaryButton:hover {
+                background-color: #2a8b4a;
+            }
+            QPushButton#DialogPrimaryButton:pressed {
+                background-color: #15562a;
+            }
+        """)
+
+    def _add_section(self, parent_layout: QVBoxLayout, heading: str, rows: List[Tuple[str, List[str]]]):
+        parent_layout.addWidget(self._create_section_card(heading, rows))
+
+    def _create_section_card(self, heading: str, rows: List[Tuple[str, List[str]]]) -> QWidget:
+        card = QWidget(self)
+        card.setObjectName("SectionCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        heading_lbl = QLabel(heading, card)
+        heading_lbl.setObjectName("SectionHeading")
+        heading_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(heading_lbl)
+
+        for description, actions in rows:
+            row_widget = QWidget(card)
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(14)
+
+            desc_lbl = QLabel(description, row_widget)
+            desc_lbl.setObjectName("ShortcutDescription")
+            desc_lbl.setWordWrap(True)
+            row_layout.addWidget(desc_lbl, 1)
+
+            keys_lbl = QLabel(row_widget)
+            keys_lbl.setObjectName("ShortcutKey")
+            keys_lbl.setTextFormat(Qt.RichText)
+            keys_lbl.setWordWrap(True)
+            keys_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            keys_lbl.setText(self._format_actions(actions))
+            row_layout.addWidget(keys_lbl, 0, Qt.AlignRight)
+
+            layout.addWidget(row_widget)
+
+        return card
+
+    def _create_intro_card(self) -> QWidget:
+        card = QWidget(self)
+        card.setObjectName("SectionCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        heading_lbl = QLabel("Get rolling", card)
+        heading_lbl.setObjectName("SectionHeading")
+        layout.addWidget(heading_lbl)
+
+        text_lbl = QLabel(card)
+        text_lbl.setObjectName("ShortcutDescription")
+        text_lbl.setTextFormat(Qt.RichText)
+        text_lbl.setWordWrap(True)
+        text_lbl.setText(
+            "<ol style='margin:0; padding-left:18px;'>"
+            "<li>Open a folder of RAW files to load your filmstrip.</li>"
+            "<li>Step through each frame with the navigation shortcuts below and pick the keepers.</li>"
+            "<li>Export when you're ready to copy the selected shots out.</li>"
+            "</ol>"
+        )
+        layout.addWidget(text_lbl)
+
+        return card
+
+    def _format_actions(self, actions: List[str]) -> str:
+        parts = [self._format_action(action) for action in actions]
+        sep = "&nbsp;&nbsp;<span style='color:#6c757d;'>•</span>&nbsp;&nbsp;"
+        return sep.join(parts)
+
+    def _format_action(self, action: str) -> str:
+        value = (self.hotkeys.get(action) or '').strip()
+        if not value:
+            return "<span style='color:#7c7c7c;'>Disabled</span>"
+        sequences = [seg.strip() for seg in value.split(',') if seg.strip()]
+        if not sequences:
+            return "<span style='color:#7c7c7c;'>Disabled</span>"
+        chip_style = (
+            "background-color:#3a3f44; color:#f7f7f7; "
+            "border-radius:7px; padding:4px 12px; font-weight:600;"
+        )
+        sep = "&nbsp;&nbsp;<span style='color:#6c757d;'>or</span>&nbsp;&nbsp;"
+        return sep.join(
+            f"<span style='{chip_style}'>{_h(seq)}</span>" for seq in sequences
+        )
+
+    def _create_ratings_card(self) -> QWidget:
+        card = QWidget(self)
+        card.setObjectName("SectionCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        heading_lbl = QLabel("Ratings & labels", card)
+        heading_lbl.setObjectName("SectionHeading")
+        layout.addWidget(heading_lbl)
+
+        text_lbl = QLabel(card)
+        text_lbl.setObjectName("ShortcutDescription")
+        text_lbl.setTextFormat(Qt.RichText)
+        text_lbl.setWordWrap(True)
+        text_lbl.setText(self._build_ratings_text())
+        layout.addWidget(text_lbl)
+
+        return card
+
+    def _build_ratings_text(self) -> str:
+        rating_lines = [
+            f"<span style='font-weight:600; color:#ffd166;'>{stars}★</span> {self._format_action(f'rate_{stars}')}"
+            for stars in range(1, 6)
+        ]
+        color_map = [
+            ("Red", "label_red", "#ff6b6b"),
+            ("Yellow", "label_yellow", "#ffd54f"),
+            ("Green", "label_green", "#9de280"),
+            ("Blue", "label_blue", "#64b5f6"),
+            ("Purple", "label_purple", "#ce93d8"),
+        ]
+        color_lines = [
+            f"<span style='font-weight:600; color:{color};'>{name}</span> {self._format_action(action)}"
+            for name, action, color in color_map
+        ]
+        return (
+            "<div>"
+            "  <div style='margin-bottom:8px;'>" + "<br>".join(rating_lines) + "</div>"
+            "  <div>" + "<br>".join(color_lines) + "</div>"
+            "</div>"
+        )
+
+    def _create_mouse_card(self) -> QWidget:
+        card = QWidget(self)
+        card.setObjectName("SectionCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        heading_lbl = QLabel("Mouse tips", card)
+        heading_lbl.setObjectName("SectionHeading")
+        layout.addWidget(heading_lbl)
+
+        text_lbl = QLabel(
+            "<ul style='margin:0; padding-left:18px;'>"
+            "<li>Scroll the mouse wheel to zoom in or out.</li>"
+            "<li>Click and drag while zoomed to pan around the photo.</li>"
+            "</ul>",
+            card,
+        )
+        text_lbl.setObjectName("ShortcutDescription")
+        text_lbl.setTextFormat(Qt.RichText)
+        text_lbl.setWordWrap(True)
+        layout.addWidget(text_lbl)
+
+        return card
+
+
 def read_xmp_sidecar(path: str) -> Dict:
     """Reads rating, label, and pick status from an XMP sidecar file."""
     if exiv2 is None: return {}
@@ -2169,42 +2495,8 @@ class CullingWidget(QWidget):
         self._set_meta_label(m_final)
 
     def show_help(self):
-        hotkeys = self.settings.hotkeys
-        def binding_display(action: str) -> str:
-            value = (hotkeys.get(action) or '').strip()
-            if value:
-                return value
-            return 'Disabled'
-
-        rating_lines = [
-            f"{stars}★: {binding_display(f'rate_{stars}')}" for stars in range(1, 6)
-        ]
-        color_labels = [
-            ('label_red', 'Red'),
-            ('label_yellow', 'Yellow'),
-            ('label_green', 'Green'),
-            ('label_blue', 'Blue'),
-            ('label_purple', 'Purple'),
-        ]
-        color_lines = [
-            f"{label}: {binding_display(action)}" for action, label in color_labels
-        ]
-
-        xmp_hotkeys = (
-            "<b>Rating & Labels:</b>\n"
-            f"  {', '.join(rating_lines)}\n"
-            f"  {', '.join(color_lines)}"
-        )
-        QMessageBox.information(self, "Key Bindings",
-            f"Navigate: {hotkeys.get('next','')} (Next), {hotkeys.get('prev','')} (Previous)\n"
-            f"Mouse: Wheel to zoom, Drag to pan (when zoomed)\n"
-            f"Select: {hotkeys.get('toggle_select','')} (Toggle), {hotkeys.get('unselect','')} (Unselect)\n"
-            f"View Modes: {hotkeys.get('toggle_zebra','')} (Toggle Zebra/Histogram), {hotkeys.get('toggle_hdr','')} (Toggle Faux HDR Preview)\n"
-            f"Filters: {hotkeys.get('toggle_selected_view','')} (Toggle Selected Only View)\n"
-            f"Save/Export: {hotkeys.get('save','')} (Save selections.json), {hotkeys.get('export','')} (Export)\n"
-            f"Exit: {hotkeys.get('quit','')}\n\n"
-            f"{xmp_hotkeys}"
-        )
+        dialog = HotkeyDialog(self, self.settings.hotkeys)
+        dialog.exec()
 
     def _current(self) -> Optional[Photo]:
         if not self.catalog.photos: return None
@@ -3128,14 +3420,17 @@ class CompletionDialog(QDialog):
         form = QFormLayout(); form.setSpacing(10); form.setLabelAlignment(Qt.AlignRight)
 
         sel_lbl = QLabel(f"<b>{selected_count}</b> selected")
+        sel_lbl.setTextFormat(Qt.RichText)
         form.addRow("Selected:", sel_lbl)
 
         raw_row = QLabel(f"<b>{dest_raw_count}</b> files  |  <i>{_h(raw_path)}</i>")
+        raw_row.setTextFormat(Qt.RichText)
         raw_row.setWordWrap(True)
         form.addRow("RAW:", raw_row)
 
         if dest_jpeg_count > 0:
             jpg_row = QLabel(f"<b>{dest_jpeg_count}</b> files  |  <i>{_h(jpeg_path)}</i>")
+            jpg_row.setTextFormat(Qt.RichText)
             jpg_row.setWordWrap(True)
             form.addRow("JPEG:", jpg_row)
 
@@ -3345,6 +3640,7 @@ class AppWindow(QMainWindow):
         self.resize(1200, 800)
         self.args = args
         self.settings = AppSettings()
+        self.has_seen_tutorial = False
         self.culling_widget: Optional[CullingWidget] = None
         self._export_thread: Optional[QThread] = None
         self._export_worker: Optional[ExportWorker] = None
@@ -3384,12 +3680,17 @@ class AppWindow(QMainWindow):
             with open(self.app_state_file, 'r', encoding='utf-8') as f:
                 state = json.load(f)
                 self.recent_folders = state.get("recent_folders", [])
+                self.has_seen_tutorial = bool(state.get("has_seen_tutorial", False))
         except (FileNotFoundError, json.JSONDecodeError):
             self.recent_folders = []
+            self.has_seen_tutorial = False
 
     def _save_app_state(self):
         try:
-            state = {"recent_folders": self.recent_folders}
+            state = {
+                "recent_folders": self.recent_folders,
+                "has_seen_tutorial": self.has_seen_tutorial,
+            }
             with open(self.app_state_file, 'w', encoding='utf-8') as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
@@ -3461,6 +3762,8 @@ class AppWindow(QMainWindow):
         self.culling_widget.export_requested.connect(self.handle_export)
         self.stack.addWidget(self.culling_widget)
         self.stack.setCurrentWidget(self.culling_widget)
+        if not self.has_seen_tutorial:
+            QTimer.singleShot(200, self._show_first_time_tutorial)
         self.update_toolbar_state(is_culling=True)
 
     def open_settings(self):
@@ -3474,9 +3777,17 @@ class AppWindow(QMainWindow):
         if self.culling_widget:
             self.culling_widget.show_help()
         else:
-            QMessageBox.information(self, "Help", 
+            QMessageBox.information(self, "Help",
                 "Open a folder to start.\n\n"
                 "Shortcuts will be available during culling.")
+
+    def _show_first_time_tutorial(self):
+        if not self.culling_widget:
+            return
+        self.culling_widget.show_help()
+        if not self.has_seen_tutorial:
+            self.has_seen_tutorial = True
+            self._save_app_state()
 
     def _perform_export(
         self,
