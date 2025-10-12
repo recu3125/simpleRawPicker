@@ -2522,7 +2522,10 @@ class CullingWidget(QWidget):
         self._set_meta_label(m_final)
 
     def show_help(self):
-        dialog = HotkeyDialog(self, self.settings.hotkeys)
+        parent_widget = self.window()
+        if not isinstance(parent_widget, QWidget):
+            parent_widget = self
+        dialog = HotkeyDialog(parent_widget, self.settings.hotkeys)
         dialog.exec()
 
     def _current(self) -> Optional[Photo]:
@@ -3697,6 +3700,7 @@ class AppWindow(QMainWindow):
 
         self._create_toolbar()
         self.update_toolbar_state(is_culling=False)
+        QTimer.singleShot(200, self._show_help_if_first_time)
 
     def _load_app_state(self):
         try:
@@ -3796,21 +3800,24 @@ class AppWindow(QMainWindow):
                 self.culling_widget.update_settings()
             self.status.showMessage("Settings updated.", 2000)
             
+    def show_help_dialog(self, parent: Optional[QWidget] = None):
+        dialog = HotkeyDialog(parent or self, self.settings.hotkeys)
+        dialog.exec()
+
     def open_help(self):
-        if self.culling_widget:
-            self.culling_widget.show_help()
-        else:
-            QMessageBox.information(self, "Help",
-                "Open a folder to start.\n\n"
-                "Shortcuts will be available during culling.")
+        self.show_help_dialog()
 
     def _show_first_time_tutorial(self):
         if not self.culling_widget:
             return
-        self.culling_widget.show_help()
-        if not self.has_seen_tutorial:
-            self.has_seen_tutorial = True
-            self._save_app_state()
+        self._show_help_if_first_time()
+
+    def _show_help_if_first_time(self):
+        if self.has_seen_tutorial:
+            return
+        self.show_help_dialog()
+        self.has_seen_tutorial = True
+        self._save_app_state()
 
     def _perform_export(
         self,
