@@ -1277,8 +1277,8 @@ class ImageView(QLabel):
             stripe = ((xx + yy + phase) % period) < duty
             mh = self._overlay_cache["mask_hi"]
             ml = self._overlay_cache["mask_lo"]
-            overlay[mh & stripe] = [130, 0, 0, 255]
-            overlay[(ml & stripe) & ~mh] = [0, 0, 130, 255]
+            overlay[mh & stripe] = [255, 39, 39, 255]
+            overlay[(ml & stripe) & ~mh] = [75, 75, 255, 255]
             overlay[(ml & mh) & stripe]  = [255, 0, 255, 180]
 
         if overlay.any():
@@ -1591,7 +1591,6 @@ class LoaderSignals(QObject):
 @dataclass
 class AppSettings:
     autosave_interval_min: int = 1
-    output_folder_name: str = "selected"
     raw_output_folder_name: str = "_selected_raw"
     jpeg_output_folder_name: str = "_selected_jpeg"
     hotkeys: Dict[str, str] = field(default_factory=lambda: OrderedDict(DEFAULT_HOTKEYS))
@@ -3302,9 +3301,6 @@ class SettingsDialog(QDialog):
         self.autosave_spinbox.setValue(self.settings.autosave_interval_min)
         self.autosave_spinbox.setSuffix(" minute(s)")
         form_layout.addRow("Autosave Interval:", self.autosave_spinbox)
-
-        self.output_folder_edit = QLineEdit(self.settings.output_folder_name)
-        form_layout.addRow("Output Folder Name:", self.output_folder_edit)
         
         self.raw_output_folder_edit = QLineEdit(self.settings.raw_output_folder_name)
         form_layout.addRow("Raw Output Folder Name:", self.raw_output_folder_edit)
@@ -3385,7 +3381,6 @@ class SettingsDialog(QDialog):
 
     def accept(self):
         self.settings.autosave_interval_min = self.autosave_spinbox.value()
-        self.settings.output_folder_name = self.output_folder_edit.text() or "selected"
         self.settings.raw_output_folder_name = self.raw_output_folder_edit.text() or "_selected_raw"
         self.settings.jpeg_output_folder_name = self.jpeg_output_folder_edit.text() or "_selected_jpeg"
         
