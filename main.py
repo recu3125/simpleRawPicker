@@ -35,7 +35,22 @@ from PySide6.QtCore import (
     QStandardPaths,
     QThread,
 )
-from PySide6.QtGui import QPixmap, QKeySequence, QAction, QPainter, QPen, QColor, QFontDatabase, QFont, QIcon, QImage, QPolygon, QPainterPath, QBrush
+from PySide6.QtGui import (
+    QPixmap,
+    QKeySequence,
+    QAction,
+    QPainter,
+    QPen,
+    QColor,
+    QFontDatabase,
+    QFont,
+    QIcon,
+    QImage,
+    QPolygon,
+    QPainterPath,
+    QBrush,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QMessageBox, QFrame,
     QStatusBar, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStackedWidget,
@@ -92,7 +107,7 @@ DEFAULT_HOTKEYS = OrderedDict([
     ('save', ''),
     ('export', 'Ctrl+S'),
     ('help', 'F1'),
-    ('quit', 'Esc'),
+    ('quit', ''),
 ])
 
 _XMP_GLOBAL_LOCK = threading.Lock()
@@ -3688,6 +3703,9 @@ class AppWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
+        self.stack.currentChanged.connect(self._update_help_shortcut_enabled_state)
+        self._help_shortcuts: List[QShortcut] = []
+
         self.welcome_screen = WelcomeWidget(
             on_select_folder=self.select_folder,
             recent_folders=self.recent_folders
@@ -3700,6 +3718,7 @@ class AppWindow(QMainWindow):
 
         self._create_toolbar()
         self.update_toolbar_state(is_culling=False)
+        self._refresh_help_shortcuts()
         QTimer.singleShot(200, self._show_help_if_first_time)
 
     def _load_app_state(self):
@@ -3746,6 +3765,35 @@ class AppWindow(QMainWindow):
         self.act_complete = QAction("Complete", self)
         self.act_complete.triggered.connect(self.complete_culling)
         self.toolbar.addAction(self.act_complete)
+
+    def _refresh_help_shortcuts(self):
+        for shortcut in getattr(self, "_help_shortcuts", []):
+            try:
+                shortcut.activated.disconnect(self._handle_help_shortcut)
+            except (TypeError, RuntimeError):
+                pass
+            shortcut.setEnabled(False)
+            shortcut.deleteLater()
+        self._help_shortcuts = []
+
+        sequence_str = (self.settings.hotkeys.get('help') if self.settings else "") or ""
+        sequences = [s.strip() for s in sequence_str.split(',') if s.strip()]
+        for seq in sequences:
+            shortcut = QShortcut(QKeySequence(seq), self)
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.activated.connect(self._handle_help_shortcut)
+            self._help_shortcuts.append(shortcut)
+
+        self._update_help_shortcut_enabled_state()
+
+    def _handle_help_shortcut(self):
+        if self.stack.currentWidget() is self.welcome_screen:
+            self.open_help()
+
+    def _update_help_shortcut_enabled_state(self):
+        enabled = self.stack.currentWidget() is self.welcome_screen
+        for shortcut in getattr(self, "_help_shortcuts", []):
+            shortcut.setEnabled(enabled)
 
     def update_toolbar_state(self, is_culling: bool):
         self.act_settings.setEnabled(True)
@@ -3798,6 +3846,7 @@ class AppWindow(QMainWindow):
         if dialog.exec():
             if self.culling_widget:
                 self.culling_widget.update_settings()
+            self._refresh_help_shortcuts()
             self.status.showMessage("Settings updated.", 2000)
             
     def show_help_dialog(self, parent: Optional[QWidget] = None):
