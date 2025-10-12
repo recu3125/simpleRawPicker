@@ -145,6 +145,7 @@ class HotkeyDialog(QDialog):
         content_layout.setSpacing(14)
 
         content_layout.addWidget(self._create_intro_card())
+        content_layout.addWidget(self._create_file_support_card())
 
         self._add_section(content_layout, "Navigate the roll", [
             ("Next photo", ["next"]),
@@ -254,7 +255,7 @@ class HotkeyDialog(QDialog):
                 font-size: 10.5pt;
             }
             QPushButton#DialogPrimaryButton {
-                background-color: #1b6d35;
+                background-color: #3bad55;
                 color: #ffffff;
                 font-weight: 600;
                 border-radius: 9px;
@@ -327,6 +328,33 @@ class HotkeyDialog(QDialog):
             "<li>Step through each frame with the navigation shortcuts below and pick the keepers.</li>"
             "<li>Export when you're ready to copy the selected shots out.</li>"
             "</ol>"
+        )
+        layout.addWidget(text_lbl)
+
+        return card
+
+    def _create_file_support_card(self) -> QWidget:
+        card = QWidget(self)
+        card.setObjectName("SectionCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        heading_lbl = QLabel("Supported files", card)
+        heading_lbl.setObjectName("SectionHeading")
+        layout.addWidget(heading_lbl)
+
+        raw_exts = ", ".join(sorted(ext.upper() for ext in SUPPORTED_EXTS))
+
+        text_lbl = QLabel(card)
+        text_lbl.setObjectName("ShortcutDescription")
+        text_lbl.setTextFormat(Qt.RichText)
+        text_lbl.setWordWrap(True)
+        text_lbl.setText(
+            "<p>Simple Raw Picker scans only the folder you open and lists RAW files with these extensions: "
+            f"{_h(raw_exts)}.</p>"
+            "<p>Keep the images you want to cull directly in that top-level folder—subfolders aren't indexed.</p>"
+            "<p>If a JPEG shares the same base name as a loaded RAW (<code>DSC0001.ARW</code> and <code>DSC0001.JPG</code>), it is copied to the JPEG export folder when you export. "
         )
         layout.addWidget(text_lbl)
 
