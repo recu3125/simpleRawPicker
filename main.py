@@ -94,6 +94,10 @@ DEFAULT_HOTKEYS = OrderedDict([
     ('toggle_zebra', 'Q'),
     ('toggle_hdr', 'E'),
     ('toggle_selected_view', 'F'),
+    ('save', ''),
+    ('export', 'Ctrl+S'),
+    ('help', 'F1'),
+    ('quit', ''),
     ('rate_1', '1'),
     ('rate_2', '2'),
     ('rate_3', '3'),
@@ -104,15 +108,34 @@ DEFAULT_HOTKEYS = OrderedDict([
     ('label_green', '8'),
     ('label_blue', '9'),
     ('label_purple', '0'),
-    ('save', ''),
-    ('export', 'Ctrl+S'),
-    ('help', 'F1'),
-    ('quit', ''),
 ])
 
+_HOTKEY_STAR_COLOR = "#f5c518"
+_HOTKEY_COLOR_SWATCHES = {
+    'label_red': ("Red", "#ff5f5f"),
+    'label_yellow': ("Yellow", "#f6d354"),
+    'label_green': ("Green", "#7dd57d"),
+    'label_blue': ("Blue", "#6aa5ff"),
+    'label_purple': ("Purple", "#c98dff"),
+}
+
+
+def _styled_hotkey_label(action: str, fallback_text: str) -> Tuple[str, bool]:
+    if action.startswith('rate_') and action[-1].isdigit():
+        rating = action[-1]
+        return f"{rating}<span style=\"color:{_HOTKEY_STAR_COLOR};\">★</span> Rating:", True
+
+    swatch = _HOTKEY_COLOR_SWATCHES.get(action)
+    if swatch is not None:
+        color_name, color_value = swatch
+        return (
+            f"Label {color_name}<span style=\"color:{color_value};\">●</span>:",
+            True,
+        )
+
+    return fallback_text, False
+
 _XMP_GLOBAL_LOCK = threading.Lock()
-
-
 class HotkeyDialog(QDialog):
     def __init__(self, parent: QWidget, hotkeys: Dict[str, str]):
         super().__init__(parent)
@@ -159,29 +182,32 @@ class HotkeyDialog(QDialog):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(14)
 
-        content_layout.addWidget(self._create_intro_card())
-        content_layout.addWidget(self._create_file_support_card())
+        content_layout.addWidget(self._create_step_card(
+            "1. Prepare your shoot folder",
+            self._build_prepare_folder_text(),
+        ))
 
-        self._add_section(content_layout, "Navigate the roll", [
-            ("Next photo", ["next"]),
-            ("Previous photo", ["prev"]),
-            ("Toggle selected-only view", ["toggle_selected_view"]),
-        ])
+        content_layout.addWidget(self._create_step_card(
+            "2. Choose a folder on the start screen",
+            "<p>On launch you'll see the welcome screen. Click <b>Select Folder to Start</b> or pick from the recent list to jump back in.</p>",
+        ))
 
-        self._add_section(content_layout, "Pick the keepers", [
-            ("Toggle pick", ["toggle_select"]),
-            ("Export picked photos", ["export"]),
-        ])
+        content_layout.addWidget(self._create_step_card(
+            "3. Review and cull",
+            self._build_review_text(),
+        ))
 
-        self._add_section(content_layout, "Viewing tools", [
-            ("Toggle zebra / histogram overlay", ["toggle_zebra"]),
-            ("Toggle HDR preview", ["toggle_hdr"]),
-        ])
-
-        content_layout.addWidget(self._create_ratings_card())
-        content_layout.addWidget(self._create_mouse_card())
+        content_layout.addWidget(self._create_step_card(
+            "4. Export your picks",
+            self._build_export_text(),
+        ))
 
         content_layout.addStretch(1)
+
+        content_layout.addWidget(self._create_step_card(
+            "",
+            "Shortcuts can be viewed and customized in Settings."
+        ))
 
         footer = QLabel("Press F1 any time to reopen this guide.", self)
         footer.setObjectName("DialogFooter")
@@ -284,185 +310,59 @@ class HotkeyDialog(QDialog):
             }
         """)
 
-    def _add_section(self, parent_layout: QVBoxLayout, heading: str, rows: List[Tuple[str, List[str]]]):
-        parent_layout.addWidget(self._create_section_card(heading, rows))
-
-    def _create_section_card(self, heading: str, rows: List[Tuple[str, List[str]]]) -> QWidget:
+    def _create_step_card(self, heading: str, body_html: str) -> QWidget:
         card = QWidget(self)
         card.setObjectName("SectionCard")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(10)
 
-        heading_lbl = QLabel(heading, card)
-        heading_lbl.setObjectName("SectionHeading")
-        heading_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        layout.addWidget(heading_lbl)
+        if(heading!=""):
+            heading_lbl = QLabel(heading, card)
+            heading_lbl.setObjectName("SectionHeading")
+            heading_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addWidget(heading_lbl)
 
-        for description, actions in rows:
-            row_widget = QWidget(card)
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(14)
-
-            desc_lbl = QLabel(description, row_widget)
-            desc_lbl.setObjectName("ShortcutDescription")
-            desc_lbl.setWordWrap(True)
-            row_layout.addWidget(desc_lbl, 1)
-
-            keys_lbl = QLabel(row_widget)
-            keys_lbl.setObjectName("ShortcutKey")
-            keys_lbl.setTextFormat(Qt.RichText)
-            keys_lbl.setWordWrap(True)
-            keys_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            keys_lbl.setText(self._format_actions(actions))
-            row_layout.addWidget(keys_lbl, 0, Qt.AlignRight)
-
-            layout.addWidget(row_widget)
+        if(body_html!=""):
+            body_lbl = QLabel(card)
+            body_lbl.setObjectName("ShortcutDescription")
+            body_lbl.setTextFormat(Qt.RichText)
+            body_lbl.setWordWrap(True)
+            body_lbl.setText(body_html)
+            layout.addWidget(body_lbl)
 
         return card
 
-    def _create_intro_card(self) -> QWidget:
-        card = QWidget(self)
-        card.setObjectName("SectionCard")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(10)
-
-        heading_lbl = QLabel("Get rolling", card)
-        heading_lbl.setObjectName("SectionHeading")
-        layout.addWidget(heading_lbl)
-
-        text_lbl = QLabel(card)
-        text_lbl.setObjectName("ShortcutDescription")
-        text_lbl.setTextFormat(Qt.RichText)
-        text_lbl.setWordWrap(True)
-        text_lbl.setText(
-            "<ol style='margin:0; padding-left:18px;'>"
-            "<li>Open a folder of RAW files to load your filmstrip.</li>"
-            "<li>Step through each frame with the navigation shortcuts below and pick the keepers.</li>"
-            "<li>Export when you're ready to copy the selected shots out.</li>"
-            "</ol>"
-        )
-        layout.addWidget(text_lbl)
-
-        return card
-
-    def _create_file_support_card(self) -> QWidget:
-        card = QWidget(self)
-        card.setObjectName("SectionCard")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(10)
-
-        heading_lbl = QLabel("Supported files", card)
-        heading_lbl.setObjectName("SectionHeading")
-        layout.addWidget(heading_lbl)
-
+    def _build_prepare_folder_text(self) -> str:
         raw_exts = ", ".join(sorted(ext.upper() for ext in SUPPORTED_EXTS))
-
-        text_lbl = QLabel(card)
-        text_lbl.setObjectName("ShortcutDescription")
-        text_lbl.setTextFormat(Qt.RichText)
-        text_lbl.setWordWrap(True)
-        text_lbl.setText(
-            "<p>Simple Raw Picker scans only the folder you open and lists RAW files with these extensions: "
-            f"{_h(raw_exts)}.</p>"
-            "<p>Keep the images you want to cull directly in that top-level folder—subfolders aren't indexed.</p>"
-            "<p>If a JPEG shares the same base name as a loaded RAW (<code>DSC0001.ARW</code> and <code>DSC0001.JPG</code>), it is copied to the JPEG export folder when you export. "
-        )
-        layout.addWidget(text_lbl)
-
-        return card
-
-    def _format_actions(self, actions: List[str]) -> str:
-        parts = [self._format_action(action) for action in actions]
-        sep = "&nbsp;&nbsp;<span style='color:#6c757d;'>•</span>&nbsp;&nbsp;"
-        return sep.join(parts)
-
-    def _format_action(self, action: str) -> str:
-        value = (self.hotkeys.get(action) or '').strip()
-        if not value:
-            return "<span style='color:#7c7c7c;'>Disabled</span>"
-        sequences = [seg.strip() for seg in value.split(',') if seg.strip()]
-        if not sequences:
-            return "<span style='color:#7c7c7c;'>Disabled</span>"
-        chip_style = (
-            "background-color:#3a3f44; color:#f7f7f7; "
-            "border-radius:7px; padding:4px 12px; font-weight:600;"
-        )
-        sep = "&nbsp;&nbsp;<span style='color:#6c757d;'>or</span>&nbsp;&nbsp;"
-        return sep.join(
-            f"<span style='{chip_style}'>{_h(seq)}</span>" for seq in sequences
-        )
-
-    def _create_ratings_card(self) -> QWidget:
-        card = QWidget(self)
-        card.setObjectName("SectionCard")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(10)
-
-        heading_lbl = QLabel("Ratings & labels", card)
-        heading_lbl.setObjectName("SectionHeading")
-        layout.addWidget(heading_lbl)
-
-        text_lbl = QLabel(card)
-        text_lbl.setObjectName("ShortcutDescription")
-        text_lbl.setTextFormat(Qt.RichText)
-        text_lbl.setWordWrap(True)
-        text_lbl.setText(self._build_ratings_text())
-        layout.addWidget(text_lbl)
-
-        return card
-
-    def _build_ratings_text(self) -> str:
-        rating_lines = [
-            f"<span style='font-weight:600; color:#ffd166;'>{stars}★</span> {self._format_action(f'rate_{stars}')}"
-            for stars in range(1, 6)
-        ]
-        color_map = [
-            ("Red", "label_red", "#ff6b6b"),
-            ("Yellow", "label_yellow", "#ffd54f"),
-            ("Green", "label_green", "#9de280"),
-            ("Blue", "label_blue", "#64b5f6"),
-            ("Purple", "label_purple", "#ce93d8"),
-        ]
-        color_lines = [
-            f"<span style='font-weight:600; color:{color};'>{name}</span> {self._format_action(action)}"
-            for name, action, color in color_map
-        ]
         return (
-            "<div>"
-            "  <div style='margin-bottom:8px;'>" + "<br>".join(rating_lines) + "</div>"
-            "  <div>" + "<br>".join(color_lines) + "</div>"
-            "</div>"
-        )
-
-    def _create_mouse_card(self) -> QWidget:
-        card = QWidget(self)
-        card.setObjectName("SectionCard")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(10)
-
-        heading_lbl = QLabel("Mouse tips", card)
-        heading_lbl.setObjectName("SectionHeading")
-        layout.addWidget(heading_lbl)
-
-        text_lbl = QLabel(
             "<ul style='margin:0; padding-left:18px;'>"
-            "<li>Scroll the mouse wheel to zoom in or out.</li>"
-            "<li>Click and drag while zoomed to pan around the photo.</li>"
-            "</ul>",
-            card,
+            f"<li>Simple Raw Picker recognizes RAW files with these extensions: {_h(raw_exts)}.</li>"
+            "<li>Store the photos directly in the folder you open—subfolders aren't scanned.</li>"
+            "<li>Keep any matching JPEG next to the RAW file to have it copied alongside during export.</li>"
+            "<li>Ratings, color labels, and picks are written to XMP sidecars.</li>"
+            "</ul>"
         )
-        text_lbl.setObjectName("ShortcutDescription")
-        text_lbl.setTextFormat(Qt.RichText)
-        text_lbl.setWordWrap(True)
-        layout.addWidget(text_lbl)
 
-        return card
+    def _build_review_text(self) -> str:
+        return (
+            "<ul style='margin:0; padding-left:18px;'>"
+            "<li>Use the arrow keys to move through the roll and press <b>Space</b> to toggle a pick.</li>"
+            "<li>Scroll or drag to zoom in for detail checks.</li>"
+            "<li>Press <b>F</b> to show only the photos you've picked.</li>"
+            "<li>Toggle the zebra/histogram overlay with <b>Q</b> and the Faux HDR preview with <b>E</b>.</li>"
+            "<li>Apply star ratings (1–5) and color labels (6–0); they're saved straight into the XMP.</li>"
+            "</ul>"
+        )
+
+    def _build_export_text(self) -> str:
+        return (
+            "<ul style='margin:0; padding-left:18px;'>"
+            "<li>Hit <b>Complete</b> on the toolbar to export the photos you've picked.</li>"
+            "<li>Your RAW selections are copied to <code>_selected_raw</code> together with their XMP.</li>"
+            "<li>If a JPEG shares the same name, it's copied to <code>_selected_jpeg</code> automatically.</li>"
+            "</ul>"
+        )
 
 
 def read_xmp_sidecar(path: str) -> Dict:
@@ -3386,11 +3286,19 @@ class SettingsDialog(QDialog):
             'quit': 'Quit Application:'
         }
 
-        hotkey_entries = []
+        hotkey_entries: List[Tuple[str, QLabel, KeySequenceEdit]] = []
         for action, default_value in DEFAULT_HOTKEYS.items():
             key_sequence_str = self.settings.hotkeys.get(action, default_value)
-            label = QLabel(hotkey_labels.get(action, f"{action.replace('_', ' ').title()}:"))
+            fallback_label = hotkey_labels.get(action, f"{action.replace('_', ' ').title()}:")
+            label_text, is_rich = _styled_hotkey_label(action, fallback_label)
+            label = QLabel()
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            accessible_label = fallback_label.rstrip(':')
+            label.setAccessibleName(accessible_label)
+            label.setToolTip(accessible_label)
+            if is_rich:
+                label.setTextFormat(Qt.RichText)
+            label.setText(label_text)
             edit = KeySequenceEdit(key_sequence_str)
             hotkey_entries.append((action, label, edit))
 
@@ -3398,8 +3306,16 @@ class SettingsDialog(QDialog):
             if action in DEFAULT_HOTKEYS:
                 continue
             key_sequence_str = self.settings.hotkeys.get(action, '')
-            label = QLabel(hotkey_labels.get(action, f"{action.replace('_', ' ').title()}:"))
+            fallback_label = f"{action.replace('_', ' ').title()}:"
+            label_text, is_rich = _styled_hotkey_label(action, fallback_label)
+            label = QLabel()
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            accessible_label = fallback_label.rstrip(':')
+            label.setAccessibleName(accessible_label)
+            label.setToolTip(accessible_label)
+            if is_rich:
+                label.setTextFormat(Qt.RichText)
+            label.setText(label_text)
             edit = KeySequenceEdit(key_sequence_str)
             hotkey_entries.append((action, label, edit))
 
@@ -3429,7 +3345,7 @@ class SettingsDialog(QDialog):
         self.settings.autosave_interval_min = self.autosave_spinbox.value()
         self.settings.raw_output_folder_name = self.raw_output_folder_edit.text() or "_selected_raw"
         self.settings.jpeg_output_folder_name = self.jpeg_output_folder_edit.text() or "_selected_jpeg"
-        
+
         for action, edit in self.hotkey_edits.items():
             self.settings.hotkeys[action] = edit.text()
 
