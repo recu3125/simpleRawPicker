@@ -1887,7 +1887,7 @@ class CullingWidget(QWidget):
         self._taskq: PriorityQueue = PriorityQueue()
         self._task_counter = 0
         self._loader_stop = False
-        default_workers = max(2, min(8, (os.cpu_count() or 4) - 1))
+        default_workers = max(2, min(32, (os.cpu_count() or 4) - 1))
         self._num_workers = int(workers) if (workers and workers > 0) else default_workers
         self._loader_threads: List[threading.Thread] = []
         for i in range(self._num_workers):
