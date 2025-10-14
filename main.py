@@ -131,18 +131,19 @@ _HOTKEY_COLOR_SWATCHES = {
 
 THEME_COLORS = {
     'bg': {
-        'base': '#0f0f10',
-        'surface': '#151517',
-        'elevated': '#1f1f22',
+        'base': '#36363a',
+        'surface': '#3f3f44',
+        'elevated': '#49494f',
+        'photo': '#808080',
     },
     'border': {
-        'default': '#26262a',
+        'default': '#5c5c63',
     },
     'text': {
-        'primary': '#f5f5f7',
-        'secondary': '#c4c4c8',
-        'tertiary': '#8b8b90',
-        'on_accent': '#f5f5f7',
+        'primary': '#f1f1f3',
+        'secondary': '#cbcbcf',
+        'tertiary': '#a0a0a6',
+        'on_accent': '#f7f7f9',
     },
     'accent': {
         'super': '#41E27F',
@@ -152,13 +153,13 @@ THEME_COLORS = {
         'muted': '#1a3425',
     },
     'badge': {
-        'text': '#9fe5b9',
+        'text': '#dedee2',
     },
     'scrollbar': {
-        'track': '#1b1b1d',
-        'thumb': '#3a3a3f',
-        'thumb_hover': '#48484d',
-        'thumb_active': '#56565c',
+        'track': '#2f2f33',
+        'thumb': '#4a4a50',
+        'thumb_hover': '#55555c',
+        'thumb_active': '#606068',
     },
 }
 
@@ -1151,15 +1152,19 @@ class ImageView(QLabel):
                     self._top_left,
                     QSize(int(self._pil_base.width * self._zoom), int(self._pil_base.height * self._zoom))
                 )
-            
+
             if rect_to_draw.isValid():
-                padding = 6 
+                padding = 6
                 background_frame = rect_to_draw.adjusted(-padding, -padding, padding, padding)
                 painter.fillRect(background_frame, theme_qcolor('accent.super'))
 
-        if (self._rendered_pixmap and not self._rendered_pixmap.isNull() 
+        photo_brush = theme_qcolor('bg.photo')
+
+        if (self._rendered_pixmap and not self._rendered_pixmap.isNull()
                 and not self.show_hdr):
             if self._mode == 'fit':
+                if self._pm_rect.isValid():
+                    painter.fillRect(self._pm_rect, photo_brush)
                 painter.drawPixmap(self._pm_rect, self._rendered_pixmap)
             else:
                 base = self._pil_base
@@ -1168,6 +1173,7 @@ class ImageView(QLabel):
                         self._top_left,
                         QSize(int(base.width * self._zoom), int(base.height * self._zoom))
                     )
+                    painter.fillRect(target_rect, photo_brush)
                     painter.drawPixmap(target_rect, self._rendered_pixmap, self._rendered_pixmap.rect())
 
         else:
@@ -1180,7 +1186,10 @@ class ImageView(QLabel):
                         box = geom["src_pil"]
                         dpr = painter.device().devicePixelRatioF()
                         if self._mode == 'fit':
-                          self._pm_rect = QRect(int(tgt.x()), int(tgt.y()), int(tgt.width()), int(tgt.height()))
+                            self._pm_rect = QRect(int(tgt.x()), int(tgt.y()), int(tgt.width()), int(tgt.height()))
+
+                        target_qrect = QRect(int(tgt.x()), int(tgt.y()), int(tgt.width()), int(tgt.height()))
+                        painter.fillRect(target_qrect, photo_brush)
 
                         quality_scaler = 1.0
                         tw = max(1, int(tgt.width() * dpr * quality_scaler))
