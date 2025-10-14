@@ -3414,6 +3414,164 @@ class CompletionDialog(QDialog):
         btns.setCenterButtons(True)
         layout.addWidget(btns)
 
+
+class AboutDialog(QDialog):
+    def __init__(self, parent: QWidget, app_data_path: str):
+        super().__init__(parent)
+        self.setWindowTitle("About simple raw picker")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(18)
+
+        app = QApplication.instance()
+        font_family = getattr(app, "_custom_font_family", "Arial") if app else "Arial"
+
+        title = QLabel(self)
+        title.setAlignment(Qt.AlignCenter)
+        title_font = QFont(font_family, 18)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setText("simple <span style=\"color:#57b87a\">raw</span> picker")
+        title.setTextFormat(Qt.RichText)
+        layout.addWidget(title)
+
+        tagline = QLabel("fast, simple, free, RAW.", self)
+        tagline.setAlignment(Qt.AlignCenter)
+        tagline_font = QFont(font_family, 11)
+        tagline.setFont(tagline_font)
+        tagline.setStyleSheet("color:#bfbfbf;")
+        layout.addWidget(tagline)
+
+        highlight_card = QFrame(self)
+        highlight_card.setObjectName("HighlightCard")
+        highlight_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        highlight_card.setStyleSheet(
+            "#HighlightCard {"
+            "    background-color: rgba(99, 99, 99, 0.25);"
+            "    border: 1px solid rgba(131, 131, 131, 0.45);"
+            "    border-radius: 12px;"
+            "}"
+        )
+        highlight_layout = QVBoxLayout(highlight_card)
+        highlight_layout.setContentsMargins(18, 16, 18, 18)
+        highlight_layout.setSpacing(10)
+
+        highlight_title = QLabel("Contacts", highlight_card)
+        highlight_title.setAlignment(Qt.AlignLeft)
+        highlight_title.setStyleSheet(
+            "color:#77d89a; font-size:11pt; font-weight:600; letter-spacing:0.4px; background-color: transparent;"
+        )
+        highlight_layout.addWidget(highlight_title)
+        
+        highlight_layout.setSpacing(10)
+
+        email_label = QLabel(
+            '<a href="mailto:superhoy0509@gmail.com">superhoy0509@gmail.com</a>',
+            highlight_card,
+        )
+        email_label.setTextFormat(Qt.RichText)
+        email_label.setOpenExternalLinks(True)
+        email_label.setStyleSheet("color:#d7f2dc; font-size:10pt; background-color: transparent;")
+        highlight_layout.addWidget(email_label)
+        
+        support = QLabel(
+            '<a href="http://donate.recu3125.com">Support the developer</a>',
+            highlight_card,
+        )
+        support.setAlignment(Qt.AlignLeft)
+        support.setTextFormat(Qt.RichText)
+        support.setOpenExternalLinks(True)
+        support.setStyleSheet("color:#b4f0c4; font-size:10pt; background-color: transparent;")
+        highlight_layout.addWidget(support)
+
+
+        feedback_label = QLabel(
+            '<a href="https://forms.gle/QopoQ8KCXJoYZHT39">Bug reports & feedback form</a>',
+            highlight_card,
+        )
+        feedback_label.setTextFormat(Qt.RichText)
+        feedback_label.setOpenExternalLinks(True)
+        feedback_label.setStyleSheet("color:#d7f2dc; font-size:10pt; background-color: transparent;")
+        highlight_layout.addWidget(feedback_label)
+
+        layout.addWidget(highlight_card)
+
+        layout.addSpacing(6)
+
+        open_source_section = QFrame(self)
+        open_source_section.setObjectName("OpenSourceCard")
+        open_source_section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        os_layout = QVBoxLayout(open_source_section)
+        os_layout.setContentsMargins(18, 12, 18, 16)
+        os_layout.setSpacing(6)
+        open_source_section.setStyleSheet(
+            "#OpenSourceCard {"
+            "    background-color: rgba(28, 28, 28, 0.65);"
+            "    border: 1px solid rgba(70, 70, 70, 0.55);"
+            "    border-radius: 10px;"
+            "}"
+        )
+        header = QLabel("Open source components", open_source_section)
+        header.setAlignment(Qt.AlignLeft)
+        header.setStyleSheet(
+            "color:#a0a0a0; font-size:9pt; font-weight:500; letter-spacing:0.6px; background-color: transparent;"
+        )
+        os_layout.addWidget(header)
+
+        oss_entries = [
+            ("PySide6 (Qt for Python)", "https://www.qt.io/qt-for-python"),
+            ("rawpy", "https://github.com/letmaik/rawpy"),
+            ("Pillow", "https://python-pillow.org"),
+            ("NumPy", "https://numpy.org"),
+            ("psutil", "https://github.com/giampaolo/psutil"),
+            ("libexiv2 (via python-exiv2)", "https://github.com/LeoHsiao1/python-exiv2"),
+        ]
+
+        oss_links = ", ".join(
+            [f'<a style="color:#b8b8b8; text-decoration:none;" href="{url}">{name}</a>' for name, url in oss_entries]
+        )
+
+        oss_label = QLabel(oss_links, open_source_section)
+        oss_label.setTextFormat(Qt.RichText)
+        oss_label.setOpenExternalLinks(True)
+        oss_label.setWordWrap(True)
+        oss_label.setStyleSheet("color:#b8b8b8; font-size:9pt; background-color: transparent;")
+        os_layout.addWidget(oss_label)
+
+        layout.addWidget(open_source_section)
+
+        if app_data_path:
+            path_label = QLabel(
+                f"App data location: <span style=\"color:#cccccc;\">{_h(app_data_path)}</span>",
+                self,
+            )
+            path_label.setTextFormat(Qt.RichText)
+            path_label.setWordWrap(True)
+            path_label.setStyleSheet("color:#939393; font-size:9pt; background-color: transparent;")
+            layout.addWidget(path_label)
+
+
+        author_label = QLabel(
+            'Made by <a href="https://recu3125.com/">recu3125</a>',
+            self,
+        )
+        author_label.setAlignment(Qt.AlignLeft)
+        author_label.setTextFormat(Qt.RichText)
+        author_label.setOpenExternalLinks(True)
+        author_label.setStyleSheet("color:#cccccc; font-size:10pt; background-color: transparent;")
+        layout.addWidget(author_label)
+
+        layout.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
 class WelcomeWidget(QWidget):
     folder_selected = Signal(str)
 
@@ -3678,6 +3836,10 @@ class AppWindow(QMainWindow):
         self.act_help.triggered.connect(self.open_help)
         self.toolbar.addAction(self.act_help)
 
+        self.act_about = QAction("About", self)
+        self.act_about.triggered.connect(self.open_about)
+        self.toolbar.addAction(self.act_about)
+
         self.act_complete = QAction("Complete", self)
         self.act_complete.triggered.connect(self.complete_culling)
         self.toolbar.addAction(self.act_complete)
@@ -3771,6 +3933,10 @@ class AppWindow(QMainWindow):
 
     def open_help(self):
         self.show_help_dialog()
+
+    def open_about(self):
+        dialog = AboutDialog(self, self.app_data_path)
+        dialog.exec()
 
     def _show_first_time_tutorial(self):
         if not self.culling_widget:
