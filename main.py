@@ -3281,7 +3281,7 @@ class SettingsDialog(QDialog):
             'label_blue': 'Label Blue:',
             'label_purple': 'Label Purple:',
             'save': 'Save Selections:',
-            'export': 'Export Selected:',
+            'export': 'Save Progress:',
             'help': 'Show Help:',
             'quit': 'Quit Application:'
         }
