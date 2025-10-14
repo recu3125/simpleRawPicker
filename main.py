@@ -64,6 +64,15 @@ try:
 except Exception:
     psutil = None
 
+
+def theme_color(path: str) -> str:
+    group, key = path.split('.')
+    return THEME_COLORS[group][key]
+
+
+def theme_qcolor(path: str) -> QColor:
+    return QColor(theme_color(path))
+
 def _prof_enabled():
     app = QApplication.instance()
     return bool(getattr(app, "_profile_enabled", False)) if app else False
@@ -117,6 +126,40 @@ _HOTKEY_COLOR_SWATCHES = {
     'label_green': ("Green", "#7dd57d"),
     'label_blue': ("Blue", "#6aa5ff"),
     'label_purple': ("Purple", "#c98dff"),
+}
+
+
+THEME_COLORS = {
+    'bg': {
+        'base': '#0f0f10',
+        'surface': '#151517',
+        'elevated': '#1f1f22',
+    },
+    'border': {
+        'default': '#26262a',
+    },
+    'text': {
+        'primary': '#f5f5f7',
+        'secondary': '#c4c4c8',
+        'tertiary': '#8b8b90',
+        'on_accent': '#f5f5f7',
+    },
+    'accent': {
+        'super': '#41E27F',
+        'primary': '#39a96b',
+        'hover': '#49bd7d',
+        'active': '#2f8d59',
+        'muted': '#1a3425',
+    },
+    'badge': {
+        'text': '#9fe5b9',
+    },
+    'scrollbar': {
+        'track': '#1b1b1d',
+        'thumb': '#3a3a3f',
+        'thumb_hover': '#48484d',
+        'thumb_active': '#56565c',
+    },
 }
 
 
@@ -229,85 +272,86 @@ class HotkeyDialog(QDialog):
 
         layout.addLayout(button_row)
 
-        self.setStyleSheet("""
-            QDialog#HotkeyDialog {
-                background-color: #202124;
-                border: 1px solid #35383b;
-            }
-            QLabel#DialogTitle {
+        self.setStyleSheet(f"""
+            QDialog#HotkeyDialog {{
+                background-color: {theme_color('bg.elevated')};
+                border: 1px solid {theme_color('border.default')};
+            }}
+            QLabel#DialogTitle {{
                 font-size: 18pt;
                 font-weight: 700;
-                color: #f4f4f4;
-            }
-            QLabel#DialogSubtitle {
+                color: {theme_color('text.primary')};
+            }}
+            QLabel#DialogSubtitle {{
                 font-size: 11pt;
-                color: #c2c7cc;
-            }
-            QLabel#DialogFooter {
-                color: #9096a0;
+                color: {theme_color('text.secondary')};
+            }}
+            QLabel#DialogFooter {{
+                color: {theme_color('text.tertiary')};
                 font-size: 9.5pt;
-            }
-            QScrollArea {
+            }}
+            QScrollArea {{
                 background: transparent;
                 border: none;
-            }
-            QScrollArea > QWidget > QWidget {
+            }}
+            QScrollArea > QWidget > QWidget {{
                 background: transparent;
-            }
-            QScrollBar:vertical {
-                background-color: #1b1d20;
+            }}
+            QScrollBar:vertical {{
+                background-color: {theme_color('scrollbar.track')};
                 width: 12px;
                 margin: 6px 0 6px 4px;
                 border-radius: 6px;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #59616b;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {theme_color('scrollbar.thumb')};
                 min-height: 40px;
                 border-radius: 6px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #6e7783;
-            }
-            QScrollBar::handle:vertical:pressed {
-                background-color: #8b96a4;
-            }
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: {theme_color('scrollbar.thumb_hover')};
+            }}
+            QScrollBar::handle:vertical:pressed {{
+                background-color: {theme_color('scrollbar.thumb_active')};
+            }}
             QScrollBar::add-line:vertical,
             QScrollBar::sub-line:vertical,
             QScrollBar::add-page:vertical,
-            QScrollBar::sub-page:vertical {
+            QScrollBar::sub-page:vertical {{
                 background: none;
                 height: 0px;
-            }
-            QWidget#SectionCard {
-                background-color: #2b2d30;
+            }}
+            QWidget#SectionCard {{
+                background-color: {theme_color('bg.surface')};
                 border-radius: 14px;
-                border: 1px solid #3a3d40;
-            }
-            QLabel#SectionHeading {
+                border: 1px solid {theme_color('border.default')};
+            }}
+            QLabel#SectionHeading {{
                 font-size: 11pt;
                 font-weight: 600;
-                color: #85d7a3;
-            }
-            QLabel#ShortcutDescription {
-                color: #e5e5e5;
+                color: {theme_color('accent.primary')};
+            }}
+            QLabel#ShortcutDescription {{
+                color: {theme_color('text.primary')};
                 font-size: 10.5pt;
-            }
-            QLabel#ShortcutKey {
+            }}
+            QLabel#ShortcutKey {{
                 font-size: 10.5pt;
-            }
-            QPushButton#DialogPrimaryButton {
-                background-color: #3bad55;
-                color: #ffffff;
+                color: {theme_color('text.secondary')};
+            }}
+            QPushButton#DialogPrimaryButton {{
+                background-color: {theme_color('accent.primary')};
+                color: {theme_color('text.on_accent')};
                 font-weight: 600;
                 border-radius: 9px;
                 padding: 8px 20px;
-            }
-            QPushButton#DialogPrimaryButton:hover {
-                background-color: #2a8b4a;
-            }
-            QPushButton#DialogPrimaryButton:pressed {
-                background-color: #15562a;
-            }
+            }}
+            QPushButton#DialogPrimaryButton:hover {{
+                background-color: {theme_color('accent.hover')};
+            }}
+            QPushButton#DialogPrimaryButton:pressed {{
+                background-color: {theme_color('accent.active')};
+            }}
         """)
 
     def _create_step_card(self, heading: str, body_html: str) -> QWidget:
@@ -1029,7 +1073,7 @@ class ImageView(QLabel):
         y0 = r.top() + 14
         maxv = max(1, int(self._hist_cache.max()))
         painter.fillRect(QRect(x0-4, y0-4, w_img+8, h_img+8), QColor(0,0,0,160))
-        painter.setPen(QPen(QColor("#f0f0f0")))
+        painter.setPen(QPen(theme_qcolor('text.primary')))
         for x in range(w_img):
             v = int(self._hist_cache[x] / maxv * h_img)
             painter.drawLine(x0 + x, y0 + h_img, x0 + x, y0 + h_img - v)
@@ -1098,7 +1142,7 @@ class ImageView(QLabel):
 
     def paintEvent(self, ev):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#1e1e1e"))
+        painter.fillRect(self.rect(), theme_qcolor('bg.base'))
 
         if self._selected:
             rect_to_draw = self._pm_rect
@@ -1111,7 +1155,7 @@ class ImageView(QLabel):
             if rect_to_draw.isValid():
                 padding = 6 
                 background_frame = rect_to_draw.adjusted(-padding, -padding, padding, padding)
-                painter.fillRect(background_frame, QColor("#4CEF50"))
+                painter.fillRect(background_frame, theme_qcolor('accent.super'))
 
         if (self._rendered_pixmap and not self._rendered_pixmap.isNull() 
                 and not self.show_hdr):
@@ -1371,7 +1415,7 @@ class Filmstrip(QWidget):
 
     def paintEvent(self, ev):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#1e1e1e"))
+        p.fillRect(self.rect(), theme_qcolor('bg.surface'))
         self.rects = []
         if not self.items:
             return
@@ -1414,7 +1458,7 @@ class Filmstrip(QWidget):
             x_right = r.right() + 1 + margin
 
     def _draw_thumb(self, p: QPainter, r: QRect, pm: Optional[QPixmap], it: Dict):
-        p.fillRect(r, QColor("#222222"))
+        p.fillRect(r, theme_qcolor('bg.elevated'))
 
         if pm is not None and not pm.isNull():
             scaled_size = pm.size().scaled(r.size(), Qt.KeepAspectRatio)
@@ -1427,17 +1471,23 @@ class Filmstrip(QWidget):
         
         self._draw_rating(p, r, it.get('rating', 0))
         
-        labelBorderColor = QColor("#1e1e1e")
+        labelBorderColor = theme_qcolor('border.default')
         selectedBorderWidth = 2
         currentLineWidth = 6
-        
+
         if it.get('current'):
-            pen = QPen(QColor("#aaaaaa")); pen.setWidth(currentLineWidth); p.setPen(pen); p.drawRect(r.adjusted(-3,-3,3,3))
-            labelBorderColor = QColor("#aaaaaa")
-        
+            pen = QPen(theme_qcolor('accent.muted'))
+            pen.setWidth(currentLineWidth)
+            p.setPen(pen)
+            p.drawRect(r.adjusted(-3, -3, 3, 3))
+            labelBorderColor = theme_qcolor('accent.muted')
+
         if it.get('selected'):
-            pen = QPen(QColor("#4ffd65")); pen.setWidth(selectedBorderWidth); p.setPen(pen); p.drawRect(r)
-            labelBorderColor = QColor("#4ffd65")
+            pen = QPen(theme_qcolor('accent.super'))
+            pen.setWidth(selectedBorderWidth)
+            p.setPen(pen)
+            p.drawRect(r)
+            labelBorderColor = theme_qcolor('accent.super')
             
         self._draw_color_label(p, r, it.get('color_label', ''),labelBorderColor,selectedBorderWidth)
         
@@ -1499,19 +1549,19 @@ class Filmstrip(QWidget):
             path = QPainterPath()
             path.addText(text_rect.left(), text_rect.top() + fm.ascent(), font, filled_str)
 
-            pen = QPen(QColor("black"), 1)
+            pen = QPen(theme_qcolor('border.default'), 2)
             p.setPen(pen)
-            p.setBrush(Qt.NoBrush) 
+            p.setBrush(Qt.NoBrush)
             p.drawPath(path)
 
-            brush = QBrush(QColor("#FFD700"))
+            brush = QBrush(QColor(_HOTKEY_STAR_COLOR))
             p.setBrush(brush)
-            p.setPen(Qt.NoPen) 
+            p.setPen(Qt.NoPen)
             p.drawPath(path)
             p.setBrush(Qt.NoBrush)
 
         empty_rect = QRect(text_rect.left() + filled_width, text_rect.top(), text_rect.width() - filled_width, text_rect.height())
-        p.setPen(QColor("#808080"))
+        p.setPen(theme_qcolor('text.tertiary'))
         p.drawText(empty_rect, Qt.AlignLeft | Qt.AlignVCenter, empty_str)
     def mousePressEvent(self, e):
         pos = e.position().toPoint()
@@ -1862,38 +1912,38 @@ class CullingWidget(QWidget):
                                 "Rating and color label features are disabled.\n"
                                 "Please run `pip install py3exiv2` to install it.")
 
-        self.setStyleSheet("""
-            QWidget#card {
-                background:#2b2b2b;
-                border:1px solid #3a3a3a;
+        self.setStyleSheet(f"""
+            QWidget#card {{
+                background:{theme_color('bg.surface')};
+                border:1px solid {theme_color('border.default')};
                 border-radius:0px;
-            }
-            QWidget#filmWrap {
-                background:#242424;
-                border-top:1px solid #3a3a3a;
-            }
-            QWidget#metaBar {
-                background:#252525;
-                border-top: 1px solid #3b3b3b;
-            }
-            QLabel#metaLeft {
-                color:#e6e6e6;
-            }
-            QLabel#badge, QLabel#badgeGhost {
+            }}
+            QWidget#filmWrap {{
+                background:{theme_color('bg.elevated')};
+                border-top:1px solid {theme_color('border.default')};
+            }}
+            QWidget#metaBar {{
+                background:{theme_color('bg.surface')};
+                border-top: 1px solid {theme_color('border.default')};
+            }}
+            QLabel#metaLeft {{
+                color:{theme_color('text.primary')};
+            }}
+            QLabel#badge, QLabel#badgeGhost {{
                 padding:4px 10px;
                 border-radius:999px;
                 font-size:10pt;
-            }
-            QLabel#badge {
-                background:#1e3a28;
-                color:#b7f3c9;
-                border:1px solid #2d6a40;
-            }
-            QLabel#badgeGhost {
-                background:#2b2b2b;
-                color:#bdbdbd;
-                border:1px solid #3a3a3a;
-            }
+            }}
+            QLabel#badge {{
+                background:{theme_color('accent.muted')};
+                color:{theme_color('badge.text')};
+                border:1px solid {theme_color('accent.primary')};
+            }}
+            QLabel#badgeGhost {{
+                background:{theme_color('bg.surface')};
+                color:{theme_color('text.secondary')};
+                border:1px solid {theme_color('border.default')};
+            }}
         """)
 
     def update_settings(self):
@@ -2411,12 +2461,12 @@ class CullingWidget(QWidget):
         cam_parts = [x for x in [m.get('make'), m.get('model')] if x]; cam_line = ' '.join(cam_parts)
         lens_line = m.get('lens', ''); dt_line = m.get('dt', '')
         html = f"""
-            <div style="margin:0; padding:0;">
-              <div style="margin:0; padding:0; font-weight:600; color:#E6E6E6;">{_h(main_line)}
-                <span style="color:#9aa0a6;">&nbsp;&nbsp;|&nbsp;&nbsp;{_h(dt_line)}</span>
+            <div style=\"margin:0; padding:0;\">
+              <div style=\"margin:0; padding:0; font-weight:600; color:{theme_color('text.primary')};\">{_h(main_line)}
+                <span style=\"color:{theme_color('text.secondary')};\">&nbsp;&nbsp;|&nbsp;&nbsp;{_h(dt_line)}</span>
               </div>
-              <div style="margin:0; padding:0; font-size:9pt; color:#B0B0B0;">{_h(cam_line)}
-                <span ...>&nbsp;&nbsp;|&nbsp;&nbsp;{_h(lens_line)}</span>
+              <div style=\"margin:0; padding:0; font-size:9pt; color:{theme_color('text.secondary')};\">{_h(cam_line)}
+                <span style=\"color:{theme_color('text.tertiary')};\">&nbsp;&nbsp;|&nbsp;&nbsp;{_h(lens_line)}</span>
               </div>
             </div>"""
         self.meta_left.setText(html)
@@ -3435,7 +3485,9 @@ class AboutDialog(QDialog):
         title_font = QFont(font_family, 18)
         title_font.setBold(True)
         title.setFont(title_font)
-        title.setText("simple <span style=\"color:#57b87a\">raw</span> picker")
+        title.setText(
+            f"simple <span style=\"color:{theme_color('accent.primary')}\">raw</span> picker"
+        )
         title.setTextFormat(Qt.RichText)
         layout.addWidget(title)
 
@@ -3443,16 +3495,16 @@ class AboutDialog(QDialog):
         tagline.setAlignment(Qt.AlignCenter)
         tagline_font = QFont(font_family, 11)
         tagline.setFont(tagline_font)
-        tagline.setStyleSheet("color:#bfbfbf;")
+        tagline.setStyleSheet(f"color:{theme_color('text.secondary')};")
         layout.addWidget(tagline)
 
         highlight_card = QFrame(self)
         highlight_card.setObjectName("HighlightCard")
         highlight_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         highlight_card.setStyleSheet(
-            "#HighlightCard {"
-            "    background-color: rgba(99, 99, 99, 0.25);"
-            "    border: 1px solid rgba(131, 131, 131, 0.45);"
+            f"#HighlightCard {{"
+            f"    background-color: {theme_color('bg.surface')};"
+            f"    border: 1px solid {theme_color('border.default')};"
             "    border-radius: 12px;"
             "}"
         )
@@ -3463,7 +3515,7 @@ class AboutDialog(QDialog):
         highlight_title = QLabel("Contacts", highlight_card)
         highlight_title.setAlignment(Qt.AlignLeft)
         highlight_title.setStyleSheet(
-            "color:#77d89a; font-size:11pt; font-weight:600; letter-spacing:0.4px; background-color: transparent;"
+            f"color:{theme_color('accent.primary')}; font-size:11pt; font-weight:600; letter-spacing:0.4px; background-color: transparent;"
         )
         highlight_layout.addWidget(highlight_title)
         
@@ -3475,7 +3527,9 @@ class AboutDialog(QDialog):
         )
         email_label.setTextFormat(Qt.RichText)
         email_label.setOpenExternalLinks(True)
-        email_label.setStyleSheet("color:#d7f2dc; font-size:10pt; background-color: transparent;")
+        email_label.setStyleSheet(
+            f"color:{theme_color('text.primary')}; font-size:10pt; background-color: transparent;"
+        )
         highlight_layout.addWidget(email_label)
         
         support = QLabel(
@@ -3485,7 +3539,9 @@ class AboutDialog(QDialog):
         support.setAlignment(Qt.AlignLeft)
         support.setTextFormat(Qt.RichText)
         support.setOpenExternalLinks(True)
-        support.setStyleSheet("color:#b4f0c4; font-size:10pt; background-color: transparent;")
+        support.setStyleSheet(
+            f"color:{theme_color('accent.primary')}; font-size:10pt; background-color: transparent;"
+        )
         highlight_layout.addWidget(support)
 
 
@@ -3495,7 +3551,9 @@ class AboutDialog(QDialog):
         )
         feedback_label.setTextFormat(Qt.RichText)
         feedback_label.setOpenExternalLinks(True)
-        feedback_label.setStyleSheet("color:#d7f2dc; font-size:10pt; background-color: transparent;")
+        feedback_label.setStyleSheet(
+            f"color:{theme_color('text.primary')}; font-size:10pt; background-color: transparent;"
+        )
         highlight_layout.addWidget(feedback_label)
 
         layout.addWidget(highlight_card)
@@ -3509,16 +3567,16 @@ class AboutDialog(QDialog):
         os_layout.setContentsMargins(18, 12, 18, 16)
         os_layout.setSpacing(6)
         open_source_section.setStyleSheet(
-            "#OpenSourceCard {"
-            "    background-color: rgba(28, 28, 28, 0.65);"
-            "    border: 1px solid rgba(70, 70, 70, 0.55);"
+            f"#OpenSourceCard {{"
+            f"    background-color: {theme_color('bg.surface')};"
+            f"    border: 1px solid {theme_color('border.default')};"
             "    border-radius: 10px;"
             "}"
         )
         header = QLabel("Open source components", open_source_section)
         header.setAlignment(Qt.AlignLeft)
         header.setStyleSheet(
-            "color:#a0a0a0; font-size:9pt; font-weight:500; letter-spacing:0.6px; background-color: transparent;"
+            f"color:{theme_color('text.tertiary')}; font-size:9pt; font-weight:500; letter-spacing:0.6px; background-color: transparent;"
         )
         os_layout.addWidget(header)
 
@@ -3532,26 +3590,33 @@ class AboutDialog(QDialog):
         ]
 
         oss_links = ", ".join(
-            [f'<a style="color:#b8b8b8; text-decoration:none;" href="{url}">{name}</a>' for name, url in oss_entries]
+            [
+                f"<a style=\"color:{theme_color('text.secondary')}; text-decoration:none;\" href=\"{url}\">{name}</a>"
+                for name, url in oss_entries
+            ]
         )
 
         oss_label = QLabel(oss_links, open_source_section)
         oss_label.setTextFormat(Qt.RichText)
         oss_label.setOpenExternalLinks(True)
         oss_label.setWordWrap(True)
-        oss_label.setStyleSheet("color:#b8b8b8; font-size:9pt; background-color: transparent;")
+        oss_label.setStyleSheet(
+            f"color:{theme_color('text.secondary')}; font-size:9pt; background-color: transparent;"
+        )
         os_layout.addWidget(oss_label)
 
         layout.addWidget(open_source_section)
 
         if app_data_path:
             path_label = QLabel(
-                f"App data location: <span style=\"color:#cccccc;\">{_h(app_data_path)}</span>",
+                f"App data location: <span style=\"color:{theme_color('text.secondary')}\">{_h(app_data_path)}</span>",
                 self,
             )
             path_label.setTextFormat(Qt.RichText)
             path_label.setWordWrap(True)
-            path_label.setStyleSheet("color:#939393; font-size:9pt; background-color: transparent;")
+            path_label.setStyleSheet(
+                f"color:{theme_color('text.tertiary')}; font-size:9pt; background-color: transparent;"
+            )
             layout.addWidget(path_label)
 
 
@@ -3562,7 +3627,9 @@ class AboutDialog(QDialog):
         author_label.setAlignment(Qt.AlignLeft)
         author_label.setTextFormat(Qt.RichText)
         author_label.setOpenExternalLinks(True)
-        author_label.setStyleSheet("color:#cccccc; font-size:10pt; background-color: transparent;")
+        author_label.setStyleSheet(
+            f"color:{theme_color('text.secondary')}; font-size:10pt; background-color: transparent;"
+        )
         layout.addWidget(author_label)
 
         layout.addStretch(1)
@@ -3575,19 +3642,6 @@ class AboutDialog(QDialog):
 class WelcomeWidget(QWidget):
     folder_selected = Signal(str)
 
-    _PRIMARY_BG      = "#1b6d35"
-    _PRIMARY_BG_HOV  = "#2a8b4a"
-    _PRIMARY_BG_PR   = "#15562a"
-    _PRIMARY_BORDER  = "#57b87a"
-    _PRIMARY_SHADOW  = QColor(43, 150, 85, 110)
-
-    _RECENT_TEXT     = "#b8b8b8"
-    _RECENT_BORDER   = "#3a3a3a"
-    _RECENT_BG       = "transparent"
-    _RECENT_BG_HOV   = "#343434"
-    _RECENT_BG_PR    = "#2f2f2f"
-    _RECENT_DOT      = "#7e7e7e"
-
     GAP_TITLE_BTN    = 36
     GAP_CENTER_BOTTOM= 36
     CONTAINER_W      = 560
@@ -3596,6 +3650,13 @@ class WelcomeWidget(QWidget):
     def __init__(self, on_select_folder, recent_folders: List[str], parent=None):
         super().__init__(parent)
         self.on_select_folder = on_select_folder
+
+        accent_primary = theme_color('accent.primary')
+        accent_hover = theme_color('accent.hover')
+        accent_active = theme_color('accent.active')
+        text_on_accent = theme_color('text.on_accent')
+        text_tertiary = theme_color('text.tertiary')
+        border_default = theme_color('border.default')
 
         root_h = QHBoxLayout(self)
         root_h.setContentsMargins(0, 0, 0, 0); root_h.setSpacing(0); root_h.setAlignment(Qt.AlignCenter)
@@ -3615,7 +3676,9 @@ class WelcomeWidget(QWidget):
         font_family = getattr(app, "_custom_font_family", "Arial")
 
         self.title = QLabel(self.center_group)
-        self.title.setText(f'simple <span style="color:{self._PRIMARY_BORDER}">raw</span> picker')
+        self.title.setText(
+            f"simple <span style=\"color:{accent_primary}\">raw</span> picker"
+        )
         self.title.setTextFormat(Qt.RichText); self.title.setAlignment(Qt.AlignCenter)
         tf = QFont(font_family, 40); tf.setBold(True); self.title.setFont(tf)
         cg.addWidget(self.title, 0, Qt.AlignHCenter)
@@ -3630,18 +3693,21 @@ class WelcomeWidget(QWidget):
         self.select_btn.clicked.connect(on_select_folder)
         self.select_btn.setStyleSheet(f"""
             QPushButton#WelcomeButton {{
-                background-color: {self._PRIMARY_BG};
-                border: 1px solid {self._PRIMARY_BORDER};
-                color: #ffffff;
+                background-color: {accent_primary};
+                border: 1px solid {accent_hover};
+                color: {text_on_accent};
                 font-size: 12pt;
                 font-weight: bold;
                 padding: 12px 18px;
                 border-radius: 10px;
             }}
-            QPushButton#WelcomeButton:hover {{ background-color: {self._PRIMARY_BG_HOV}; }}
-            QPushButton#WelcomeButton:pressed {{ background-color: {self._PRIMARY_BG_PR}; }}
+            QPushButton#WelcomeButton:hover {{ background-color: {accent_hover}; }}
+            QPushButton#WelcomeButton:pressed {{ background-color: {accent_active}; }}
         """)
-        shadow = QGraphicsDropShadowEffect(self); shadow.setBlurRadius(24); shadow.setOffset(0, 4); shadow.setColor(self._PRIMARY_SHADOW)
+        shadow = QGraphicsDropShadowEffect(self); shadow.setBlurRadius(24); shadow.setOffset(0, 4)
+        shadow_color = theme_qcolor('accent.primary')
+        shadow_color.setAlpha(110)
+        shadow.setColor(shadow_color)
         self.select_btn.setGraphicsEffect(shadow)
         cg.addWidget(self.select_btn, 0, Qt.AlignHCenter)
 
@@ -3655,7 +3721,9 @@ class WelcomeWidget(QWidget):
 
         divider = QFrame(self.bottom_section)
         divider.setFrameShape(QFrame.HLine); divider.setFrameShadow(QFrame.Sunken)
-        divider.setStyleSheet("background-color:#444; color:#444;"); divider.setFixedHeight(2)
+        divider.setStyleSheet(
+            f"background-color:{border_default}; color:{border_default};"
+        ); divider.setFixedHeight(2)
         bl.addWidget(divider)
 
         bl.addSpacing(36)
@@ -3663,7 +3731,9 @@ class WelcomeWidget(QWidget):
         self.recent_header = QLabel("Recent Folders", self.bottom_section)
         self.recent_header.setAlignment(Qt.AlignLeft)
         hf = QFont(font_family, 10); hf.setLetterSpacing(QFont.PercentageSpacing, 102)
-        self.recent_header.setFont(hf); self.recent_header.setStyleSheet("color:#9a9a9a;")
+        self.recent_header.setFont(hf); self.recent_header.setStyleSheet(
+            f"color:{text_tertiary};"
+        )
         bl.addWidget(self.recent_header)
 
         self.recent_container = QWidget(self.bottom_section)
@@ -3672,7 +3742,9 @@ class WelcomeWidget(QWidget):
 
         support = QLabel('<a href="http://donate.recu3125.com">Support the developer</a>', self.bottom_section)
         support.setOpenExternalLinks(True); support.setAlignment(Qt.AlignCenter)
-        support.setStyleSheet(f"QLabel {{ color:#8fbf92; font-size:10pt; margin-top:{self.FOOTER_MARGIN_TOP}px; }}")
+        support.setStyleSheet(
+            f"QLabel {{ color:{accent_primary}; font-size:10pt; margin-top:{self.FOOTER_MARGIN_TOP}px; }}"
+        )
 
         bl.addStretch(1)
         bl.addWidget(support, 0, Qt.AlignBottom)
@@ -3706,7 +3778,9 @@ class WelcomeWidget(QWidget):
         hl = QHBoxLayout(row); hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(8)
 
         dot = QLabel(row); dot.setFixedSize(8, 8)
-        dot.setStyleSheet(f"background:{self._RECENT_DOT}; border-radius:4px;")
+        dot.setStyleSheet(
+            f"background:{theme_color('text.tertiary')}; border-radius:4px;"
+        )
         hl.addWidget(dot, 0, Qt.AlignVCenter)
 
         btn = QPushButton(display_text, row)
@@ -3717,15 +3791,15 @@ class WelcomeWidget(QWidget):
         btn.clicked.connect(lambda _=False, p=full_path: self.folder_selected.emit(p))
         btn.setStyleSheet(f"""
             QPushButton#RecentButton {{
-                background: {self._RECENT_BG};
-                color: {self._RECENT_TEXT};
-                border: 1px solid {self._RECENT_BORDER};
+                background: {theme_color('bg.surface')};
+                color: {theme_color('text.secondary')};
+                border: 1px solid {theme_color('border.default')};
                 padding: 6px 10px;
                 border-radius: 8px;
                 text-align: left;
             }}
-            QPushButton#RecentButton:hover {{ background: {self._RECENT_BG_HOV}; border-color: {self._RECENT_BORDER}; }}
-            QPushButton#RecentButton:pressed {{ background: {self._RECENT_BG_PR}; }}
+            QPushButton#RecentButton:hover {{ background: {theme_color('bg.elevated')}; border-color: {theme_color('border.default')}; }}
+            QPushButton#RecentButton:pressed {{ background: {theme_color('bg.base')}; }}
         """)
         hl.addWidget(btn, 1)
         return row
@@ -4189,12 +4263,12 @@ class AppWindow(QMainWindow):
             self._toast_label.setStyleSheet("""
                 QLabel#toastLabel {
                     background: rgba(0,0,0,180);
-                    color: #ffffff;
+                    color: %s;
                     border-radius: 8px;
                     padding: 10px 14px;
                     font-weight: 600;
                 }
-            """)
+            """ % theme_color('text.primary'))
             self._toast_label.setAlignment(Qt.AlignCenter)
             self._toast_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             self._toast_timer = QTimer(self)
@@ -4261,86 +4335,85 @@ def main():
             print(f"Warning: Could not find font family in '{font_path}'.")
             setattr(app, "_custom_font_family", "Arial")
 
-    app.setStyleSheet("""
-        QWidget {
-            background-color: #2b2b2b;
-            color: #f0f0f0;
-        }
-        QMainWindow, QDialog {
-            background-color: #2b2b2b;
-        }
-        QToolBar {
-            background: #3c3c3c;
+    app.setStyleSheet(f"""
+        QWidget {{
+            background-color: {theme_color('bg.base')};
+            color: {theme_color('text.primary')};
+        }}
+        QMainWindow, QDialog {{
+            background-color: {theme_color('bg.base')};
+        }}
+        QToolBar {{
+            background: {theme_color('bg.surface')};
             border: none;
             padding: 2px;
-        }
-        QToolBar QToolButton {
-            color: #f0f0f0;
+        }}
+        QToolBar QToolButton {{
+            color: {theme_color('text.primary')};
             background: transparent;
             padding: 6px;
             margin: 2px;
-        }
-        QToolBar QToolButton:hover {
-            background: #555;
+        }}
+        QToolBar QToolButton:hover {{
+            background: {theme_color('bg.elevated')};
             border-radius: 3px;
-        }
-        QStatusBar {
-            background: #3c3c3c;
-            color: #d0d0d0;
-        }
-        QGroupBox {
-            border: 1px solid #4a4a4a;
+        }}
+        QToolBar QToolButton:pressed {{
+            background: {theme_color('accent.muted')};
+        }}
+        QStatusBar {{
+            background: {theme_color('bg.surface')};
+            color: {theme_color('text.secondary')};
+        }}
+        QGroupBox {{
+            border: 1px solid {theme_color('border.default')};
             border-radius: 5px;
             margin-top: 1ex;
             font-weight: bold;
-        }
-        QGroupBox::title {
+        }}
+        QGroupBox::title {{
             subcontrol-origin: margin;
             subcontrol-position: top center;
             padding: 0 3px;
-        }
-        QPushButton {
-            background-color: #555;
-            color: #f0f0f0;
-            border: 1px solid #666;
+        }}
+        QPushButton {{
+            background-color: {theme_color('accent.primary')};
+            color: {theme_color('text.on_accent')};
+            border: 1px solid {theme_color('accent.hover')};
             padding: 8px 16px;
             border-radius: 4px;
-        }
-        QPushButton:hover {
-            background-color: #6a6a6a;
-            border-color: #777;
-        }
-        QPushButton:pressed {
-            background-color: #4a4a4a;
-        }
-        QPushButton:focus {
+        }}
+        QPushButton:hover {{
+            background-color: {theme_color('accent.hover')};
+        }}
+        QPushButton:pressed {{
+            background-color: {theme_color('accent.active')};
+        }}
+        QPushButton:disabled {{
+            background-color: {theme_color('bg.surface')};
+            color: {theme_color('text.tertiary')};
+            border: 1px solid {theme_color('border.default')};
+        }}
+        QPushButton:focus {{
             outline: none;
-        }
-        QPushButton#WelcomeButton {
-            background-color: #2C6F40;
-            border-color: #66BB6A;
-            font-size: 11pt;
-            font-weight: bold;
-        }
-        QPushButton#WelcomeButton:hover {
-            background-color: #66BB6A;
-        }
-        QPushButton#WelcomeButton:pressed {
-            background-color: #286E1C;
-        }
-        QLineEdit, QSpinBox {
-            background-color: #3c3c3c;
-            border: 1px solid #555;
+        }}
+        QLineEdit, QSpinBox {{
+            background-color: {theme_color('bg.surface')};
+            border: 1px solid {theme_color('border.default')};
             border-radius: 3px;
             padding: 5px;
-        }
-        QLabel a {
-            color: #4CAF50;
+            color: {theme_color('text.primary')};
+        }}
+        QLabel {{
+            background-color: transparent;
+        }}
+        QLabel a {{
+            color: {theme_color('accent.primary')};
             text-decoration: none;
-        }
-        QMessageBox {
-            background-color: #3c3c3c;
-        }
+        }}
+        QMessageBox {{
+            background-color: {theme_color('bg.surface')};
+        }}
     """)
 
 
