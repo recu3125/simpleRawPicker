@@ -3674,9 +3674,9 @@ class WelcomeWidget(QWidget):
         root_h.addWidget(col, 0, Qt.AlignCenter)
 
         v = QVBoxLayout(col); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
+        self._column_layout = v
 
-        self._sp_top    = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed)
-        self._sp_bottom = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)
+        self._sp_top = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed)
         v.addItem(self._sp_top)
 
         self.center_group = QWidget(col)
@@ -3722,8 +3722,10 @@ class WelcomeWidget(QWidget):
 
         v.addWidget(self.center_group, 0, Qt.AlignHCenter)
 
-        self._gap_between = QWidget(col); self._gap_between.setFixedHeight(self.GAP_CENTER_BOTTOM)
-        v.addWidget(self._gap_between)
+        self._sp_middle = QSpacerItem(
+            0, self.GAP_CENTER_BOTTOM, QSizePolicy.Minimum, QSizePolicy.Expanding
+        )
+        v.addItem(self._sp_middle)
 
         self.bottom_section = QWidget(col)
         bl = QVBoxLayout(self.bottom_section); bl.setContentsMargins(0, 0, 0, 20); bl.setSpacing(0)
@@ -3759,25 +3761,62 @@ class WelcomeWidget(QWidget):
         bl.addWidget(support, 0, Qt.AlignBottom)
 
         v.addWidget(self.bottom_section, 0)
-        v.addItem(self._sp_bottom)
 
         self.update_recent_folders(recent_folders)
         QTimer.singleShot(0, self._reflow)
 
     def _reflow(self):
-        H = self.height()
-        gh = self.center_group.sizeHint().height()
-        gap = self._gap_between.height()
-        bh = self.bottom_section.sizeHint().height()
+        if self._column_layout is None or not self.isVisible():
+            return
 
-        total = gh + gap + bh
-        if H >= total:
-            top_h = (H - total) // 2
+        total_h = max(0, self.height())
+        if total_h == 0:
+            return
+
+        def _block_height(widget: QWidget) -> int:
+            hint = widget.sizeHint().height()
+            layout = widget.layout()
+            if layout is not None:
+                hint = max(hint, layout.sizeHint().height())
+            return max(hint, widget.height(), widget.minimumSizeHint().height())
+
+        gh = _block_height(self.center_group)
+        bh = _block_height(self.bottom_section)
+        gap_min = self.GAP_CENTER_BOTTOM if self.bottom_section.isVisible() else 0
+
+        available = max(0, total_h - (gh + bh))
+
+        if available == 0:
+            top = middle = 0.0
         else:
-            top_h = max(0, H - total)
+            # Ideal centered placement before enforcing the minimum gap.
+            top_center = max(0.0, (total_h - gh) / 2.0)
+            gap_center = max(0.0, (total_h - gh) / 2.0 - bh)
 
-        self._sp_top.changeSize(0, top_h, QSizePolicy.Minimum, QSizePolicy.Fixed)
-        self.layout().invalidate(); self.layout().activate()
+            if gap_center >= gap_min:
+                top = min(top_center, float(available))
+                middle = max(0.0, available - top)
+            else:
+                if available <= gap_min:
+                    top = 0.0
+                    middle = float(available)
+                else:
+                    middle = float(gap_min)
+                    top = float(available) - middle
+
+        top_h = int(round(top))
+        middle_h = int(round(middle))
+
+        if top_h < 0:
+            top_h = 0
+        if middle_h < 0:
+            middle_h = 0
+
+        self._sp_top.changeSize(0, top_h, QSizePolicy.Minimum, QSizePolicy.Fixed if top_h else QSizePolicy.Minimum)
+        self._sp_middle.changeSize(0, middle_h, QSizePolicy.Minimum, QSizePolicy.Expanding)
+
+        self._column_layout.invalidate()
+        self._column_layout.activate()
 
     def resizeEvent(self, e):
         super().resizeEvent(e); self._reflow()
