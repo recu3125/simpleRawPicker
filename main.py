@@ -131,35 +131,36 @@ _HOTKEY_COLOR_SWATCHES = {
 
 THEME_COLORS = {
     'bg': {
-        'base': '#36363a',
-        'surface': '#3f3f44',
-        'elevated': '#49494f',
+        'base': '#363636',
+        'surface': '#3f3f3f',
+        'elevated': '#494949',
         'photo': '#808080',
     },
     'border': {
-        'default': '#5c5c63',
+        'default': '#5c5c5c',
     },
     'text': {
-        'primary': '#f1f1f3',
-        'secondary': '#cbcbcf',
-        'tertiary': '#a0a0a6',
-        'on_accent': '#f7f7f9',
+        'primary': '#f1f1f1',
+        'secondary': '#cbcbcb',
+        'tertiary': '#a0a0a0',
+        'on_accent': '#f7f7f7',
     },
     'accent': {
         'super': '#41E27F',
         'primary': '#39a96b',
+        'button': '#288654',
         'hover': '#49bd7d',
-        'active': '#2f8d59',
-        'muted': '#1a3425',
+        'active': '#1f7d49',
+        'muted': '#245440',
     },
     'badge': {
-        'text': '#dedee2',
+        'text': '#dedede',
     },
     'scrollbar': {
-        'track': '#2f2f33',
-        'thumb': '#4a4a50',
-        'thumb_hover': '#55555c',
-        'thumb_active': '#606068',
+        'track': '#2f2f2f',
+        'thumb': '#4a4a4a',
+        'thumb_hover': '#555555',
+        'thumb_active': '#606060',
     },
 }
 
@@ -341,7 +342,7 @@ class HotkeyDialog(QDialog):
                 color: {theme_color('text.secondary')};
             }}
             QPushButton#DialogPrimaryButton {{
-                background-color: {theme_color('accent.primary')};
+                background-color: {theme_color('accent.button')};
                 color: {theme_color('text.on_accent')};
                 font-weight: 600;
                 border-radius: 9px;
@@ -1485,11 +1486,11 @@ class Filmstrip(QWidget):
         currentLineWidth = 6
 
         if it.get('current'):
-            pen = QPen(theme_qcolor('accent.muted'))
+            pen = QPen(theme_qcolor('text.tertiary'))
             pen.setWidth(currentLineWidth)
             p.setPen(pen)
             p.drawRect(r.adjusted(-3, -3, 3, 3))
-            labelBorderColor = theme_qcolor('accent.muted')
+            labelBorderColor = theme_qcolor('text.tertiary')
 
         if it.get('selected'):
             pen = QPen(theme_qcolor('accent.super'))
@@ -3542,7 +3543,7 @@ class AboutDialog(QDialog):
         highlight_layout.addWidget(email_label)
         
         support = QLabel(
-            '<a href="http://donate.recu3125.com">Support the developer</a>',
+            '<a href="http://recu3125.com/simplerawpicker/donate">Support the developer</a>',
             highlight_card,
         )
         support.setAlignment(Qt.AlignLeft)
@@ -3555,7 +3556,7 @@ class AboutDialog(QDialog):
 
 
         feedback_label = QLabel(
-            '<a href="https://forms.gle/QopoQ8KCXJoYZHT39">Bug reports & feedback form</a>',
+            '<a href="http://recu3125.com/simplerawpicker/feedback">Bug reports & feedback form</a>',
             highlight_card,
         )
         feedback_label.setTextFormat(Qt.RichText)
@@ -3663,6 +3664,7 @@ class WelcomeWidget(QWidget):
         accent_primary = theme_color('accent.primary')
         accent_hover = theme_color('accent.hover')
         accent_active = theme_color('accent.active')
+        accent_button = theme_color('accent.button')
         text_on_accent = theme_color('text.on_accent')
         text_tertiary = theme_color('text.tertiary')
         border_default = theme_color('border.default')
@@ -3702,7 +3704,7 @@ class WelcomeWidget(QWidget):
         self.select_btn.clicked.connect(on_select_folder)
         self.select_btn.setStyleSheet(f"""
             QPushButton#WelcomeButton {{
-                background-color: {accent_primary};
+                background-color: {accent_button};
                 border: 1px solid {accent_hover};
                 color: {text_on_accent};
                 font-size: 12pt;
@@ -3749,7 +3751,7 @@ class WelcomeWidget(QWidget):
         self.recent_layout = QVBoxLayout(self.recent_container); self.recent_layout.setContentsMargins(0, 0, 0, 0); self.recent_layout.setSpacing(6)
         bl.addWidget(self.recent_container, 0, Qt.AlignTop)
 
-        support = QLabel('<a href="http://donate.recu3125.com">Support the developer</a>', self.bottom_section)
+        support = QLabel('<a href="https://recu3125.com/simplerawpicker/donate">Support the developer</a>', self.bottom_section)
         support.setOpenExternalLinks(True); support.setAlignment(Qt.AlignCenter)
         support.setStyleSheet(
             f"QLabel {{ color:{accent_primary}; font-size:10pt; margin-top:{self.FOOTER_MARGIN_TOP}px; }}"
@@ -4357,6 +4359,9 @@ def main():
             border: none;
             padding: 2px;
         }}
+        QToolBar QWidget {{
+            background: transparent;
+        }}
         QToolBar QToolButton {{
             color: {theme_color('text.primary')};
             background: transparent;
@@ -4386,7 +4391,7 @@ def main():
             padding: 0 3px;
         }}
         QPushButton {{
-            background-color: {theme_color('accent.primary')};
+            background-color: {theme_color('accent.button')};
             color: {theme_color('text.on_accent')};
             border: 1px solid {theme_color('accent.hover')};
             padding: 8px 16px;
