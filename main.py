@@ -131,36 +131,35 @@ _HOTKEY_COLOR_SWATCHES = {
 
 THEME_COLORS = {
     'bg': {
-        'base': '#363636',
-        'surface': '#3f3f3f',
-        'elevated': '#494949',
+        'base': '#36363a',
+        'surface': '#3f3f44',
+        'elevated': '#49494f',
         'photo': '#808080',
     },
     'border': {
-        'default': '#5c5c5c',
+        'default': '#5c5c63',
     },
     'text': {
-        'primary': '#f1f1f1',
-        'secondary': '#cbcbcb',
-        'tertiary': '#a0a0a0',
-        'on_accent': '#f7f7f7',
+        'primary': '#f1f1f3',
+        'secondary': '#cbcbcf',
+        'tertiary': '#a0a0a6',
+        'on_accent': '#f7f7f9',
     },
     'accent': {
         'super': '#41E27F',
         'primary': '#39a96b',
-        'button': '#288654',
         'hover': '#49bd7d',
-        'active': '#1f7d49',
-        'muted': '#245440',
+        'active': '#2f8d59',
+        'muted': '#1a3425',
     },
     'badge': {
-        'text': '#dedede',
+        'text': '#dedee2',
     },
     'scrollbar': {
-        'track': '#2f2f2f',
-        'thumb': '#4a4a4a',
-        'thumb_hover': '#555555',
-        'thumb_active': '#606060',
+        'track': '#2f2f33',
+        'thumb': '#4a4a50',
+        'thumb_hover': '#55555c',
+        'thumb_active': '#606068',
     },
 }
 
@@ -342,7 +341,7 @@ class HotkeyDialog(QDialog):
                 color: {theme_color('text.secondary')};
             }}
             QPushButton#DialogPrimaryButton {{
-                background-color: {theme_color('accent.button')};
+                background-color: {theme_color('accent.primary')};
                 color: {theme_color('text.on_accent')};
                 font-weight: 600;
                 border-radius: 9px;
@@ -1486,11 +1485,11 @@ class Filmstrip(QWidget):
         currentLineWidth = 6
 
         if it.get('current'):
-            pen = QPen(theme_qcolor('text.tertiary'))
+            pen = QPen(theme_qcolor('accent.muted'))
             pen.setWidth(currentLineWidth)
             p.setPen(pen)
             p.drawRect(r.adjusted(-3, -3, 3, 3))
-            labelBorderColor = theme_qcolor('text.tertiary')
+            labelBorderColor = theme_qcolor('accent.muted')
 
         if it.get('selected'):
             pen = QPen(theme_qcolor('accent.super'))
@@ -3543,7 +3542,7 @@ class AboutDialog(QDialog):
         highlight_layout.addWidget(email_label)
         
         support = QLabel(
-            '<a href="http://recu3125.com/simplerawpicker/donate">Support the developer</a>',
+            '<a href="http://donate.recu3125.com">Support the developer</a>',
             highlight_card,
         )
         support.setAlignment(Qt.AlignLeft)
@@ -3556,7 +3555,7 @@ class AboutDialog(QDialog):
 
 
         feedback_label = QLabel(
-            '<a href="http://recu3125.com/simplerawpicker/feedback">Bug reports & feedback form</a>',
+            '<a href="https://forms.gle/QopoQ8KCXJoYZHT39">Bug reports & feedback form</a>',
             highlight_card,
         )
         feedback_label.setTextFormat(Qt.RichText)
@@ -3664,7 +3663,6 @@ class WelcomeWidget(QWidget):
         accent_primary = theme_color('accent.primary')
         accent_hover = theme_color('accent.hover')
         accent_active = theme_color('accent.active')
-        accent_button = theme_color('accent.button')
         text_on_accent = theme_color('text.on_accent')
         text_tertiary = theme_color('text.tertiary')
         border_default = theme_color('border.default')
@@ -3676,9 +3674,9 @@ class WelcomeWidget(QWidget):
         root_h.addWidget(col, 0, Qt.AlignCenter)
 
         v = QVBoxLayout(col); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
+        self._column_layout = v
 
-        self._sp_top    = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed)
-        self._sp_bottom = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)
+        self._sp_top = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed)
         v.addItem(self._sp_top)
 
         self.center_group = QWidget(col)
@@ -3704,7 +3702,7 @@ class WelcomeWidget(QWidget):
         self.select_btn.clicked.connect(on_select_folder)
         self.select_btn.setStyleSheet(f"""
             QPushButton#WelcomeButton {{
-                background-color: {accent_button};
+                background-color: {accent_primary};
                 border: 1px solid {accent_hover};
                 color: {text_on_accent};
                 font-size: 12pt;
@@ -3724,8 +3722,10 @@ class WelcomeWidget(QWidget):
 
         v.addWidget(self.center_group, 0, Qt.AlignHCenter)
 
-        self._gap_between = QWidget(col); self._gap_between.setFixedHeight(self.GAP_CENTER_BOTTOM)
-        v.addWidget(self._gap_between)
+        self._sp_middle = QSpacerItem(
+            0, self.GAP_CENTER_BOTTOM, QSizePolicy.Minimum, QSizePolicy.Expanding
+        )
+        v.addItem(self._sp_middle)
 
         self.bottom_section = QWidget(col)
         bl = QVBoxLayout(self.bottom_section); bl.setContentsMargins(0, 0, 0, 20); bl.setSpacing(0)
@@ -3737,7 +3737,7 @@ class WelcomeWidget(QWidget):
         ); divider.setFixedHeight(2)
         bl.addWidget(divider)
 
-        bl.addSpacing(36)
+        bl.addSpacing(10)
 
         self.recent_header = QLabel("Recent Folders", self.bottom_section)
         self.recent_header.setAlignment(Qt.AlignLeft)
@@ -3746,12 +3746,13 @@ class WelcomeWidget(QWidget):
             f"color:{text_tertiary};"
         )
         bl.addWidget(self.recent_header)
+        bl.addSpacing(10)
 
         self.recent_container = QWidget(self.bottom_section)
         self.recent_layout = QVBoxLayout(self.recent_container); self.recent_layout.setContentsMargins(0, 0, 0, 0); self.recent_layout.setSpacing(6)
         bl.addWidget(self.recent_container, 0, Qt.AlignTop)
 
-        support = QLabel('<a href="https://recu3125.com/simplerawpicker/donate">Support the developer</a>', self.bottom_section)
+        support = QLabel('<a href="http://donate.recu3125.com">Support the developer</a>', self.bottom_section)
         support.setOpenExternalLinks(True); support.setAlignment(Qt.AlignCenter)
         support.setStyleSheet(
             f"QLabel {{ color:{accent_primary}; font-size:10pt; margin-top:{self.FOOTER_MARGIN_TOP}px; }}"
@@ -3761,25 +3762,62 @@ class WelcomeWidget(QWidget):
         bl.addWidget(support, 0, Qt.AlignBottom)
 
         v.addWidget(self.bottom_section, 0)
-        v.addItem(self._sp_bottom)
 
         self.update_recent_folders(recent_folders)
         QTimer.singleShot(0, self._reflow)
 
     def _reflow(self):
-        H = self.height()
-        gh = self.center_group.sizeHint().height()
-        gap = self._gap_between.height()
-        bh = self.bottom_section.sizeHint().height()
+        if self._column_layout is None or not self.isVisible():
+            return
 
-        total = gh + gap + bh
-        if H >= total:
-            top_h = (H - total) // 2
+        total_h = max(0, self.height())
+        if total_h == 0:
+            return
+
+        def _block_height(widget: QWidget) -> int:
+            hint = widget.sizeHint().height()
+            layout = widget.layout()
+            if layout is not None:
+                hint = max(hint, layout.sizeHint().height())
+            return max(hint, widget.height(), widget.minimumSizeHint().height())
+
+        gh = _block_height(self.center_group)
+        bh = _block_height(self.bottom_section)
+        gap_min = self.GAP_CENTER_BOTTOM if self.bottom_section.isVisible() else 0
+
+        available = max(0, total_h - (gh + bh))
+
+        if available == 0:
+            top = middle = 0.0
         else:
-            top_h = max(0, H - total)
+            # Ideal centered placement before enforcing the minimum gap.
+            top_center = max(0.0, (total_h - gh) / 2.0)
+            gap_center = max(0.0, (total_h - gh) / 2.0 - bh)
 
-        self._sp_top.changeSize(0, top_h, QSizePolicy.Minimum, QSizePolicy.Fixed)
-        self.layout().invalidate(); self.layout().activate()
+            if gap_center >= gap_min:
+                top = min(top_center, float(available))
+                middle = max(0.0, available - top)
+            else:
+                if available <= gap_min:
+                    top = 0.0
+                    middle = float(available)
+                else:
+                    middle = float(gap_min)
+                    top = float(available) - middle
+
+        top_h = int(round(top))
+        middle_h = int(round(middle))
+
+        if top_h < 0:
+            top_h = 0
+        if middle_h < 0:
+            middle_h = 0
+
+        self._sp_top.changeSize(0, top_h, QSizePolicy.Minimum, QSizePolicy.Fixed if top_h else QSizePolicy.Minimum)
+        self._sp_middle.changeSize(0, middle_h, QSizePolicy.Minimum, QSizePolicy.Expanding)
+
+        self._column_layout.invalidate()
+        self._column_layout.activate()
 
     def resizeEvent(self, e):
         super().resizeEvent(e); self._reflow()
@@ -4391,7 +4429,7 @@ def main():
             padding: 0 3px;
         }}
         QPushButton {{
-            background-color: {theme_color('accent.button')};
+            background-color: {theme_color('accent.primary')};
             color: {theme_color('text.on_accent')};
             border: 1px solid {theme_color('accent.hover')};
             padding: 8px 16px;
