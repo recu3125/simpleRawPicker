@@ -19,6 +19,15 @@ except Exception:
 import numpy as np
 from PIL import Image, ImageQt, ImageOps
 import rawpy
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+try:
+    import mediapipe as mp
+except Exception:
+    mp = None
 
 from PySide6.QtCore import (
     Qt,
@@ -56,7 +65,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStackedWidget,
     QToolBar, QDialog, QFormLayout, QGridLayout, QSpinBox, QLineEdit, QDialogButtonBox,
     QSizePolicy, QGroupBox, QGraphicsDropShadowEffect, QRadioButton, QSpacerItem,
-    QProgressDialog, QScrollArea
+    QProgressDialog, QScrollArea, QCheckBox
 )
 
 try:
@@ -102,7 +111,7 @@ DEFAULT_HOTKEYS = OrderedDict([
     ('unselect', 'X'),
     ('toggle_zebra', 'Q'),
     ('toggle_hdr', 'E'),
-    ('toggle_selected_view', 'F'),
+    ('show_filter_dialog', 'F'),
     # ('save', ''),
     ('export', 'Ctrl+S'),
     ('help', 'F1'),
@@ -118,6 +127,64 @@ DEFAULT_HOTKEYS = OrderedDict([
     ('label_blue', '9'),
     ('label_purple', '0'),
 ])
+
+OPEN_EYE_BUCKETS: List[Tuple[str, str]] = [
+    ("error", "Processing failed"),
+    ("no_faces", "No faces detected"),
+    ("eyes_failed", "Faces detected but eyes missing"),
+    ("0_50", "0–50% eyes open"),
+    ("50_80", "50–80% eyes open"),
+    ("80_90", "80–90% eyes open"),
+    ("90_99", "90–99% eyes open"),
+    ("100", "100% eyes open"),
+]
+OPEN_EYE_BUCKET_LABELS = {key: label for key, label in OPEN_EYE_BUCKETS}
+
+SHARPNESS_BUCKETS: List[Tuple[str, str]] = [
+    ("very_blurry", "Very blurry"),
+    ("blurry", "Blurry"),
+    ("moderate", "Moderate"),
+    ("sharp", "Sharp"),
+    ("very_sharp", "Very sharp"),
+]
+SHARPNESS_BUCKET_LABELS = {key: label for key, label in SHARPNESS_BUCKETS}
+
+ANALYSIS_VERSION = 2
+
+
+def classify_eye_bucket(open_people: int, face_people: int, valid_people: Optional[int] = None) -> Tuple[str, float]:
+    if face_people <= 0:
+        return "no_faces", 0.0
+    if valid_people is None:
+        valid_people = face_people
+    if valid_people <= 0:
+        return "eyes_failed", 0.0
+    denominator = max(valid_people, 1)
+    ratio = max(0.0, min(1.0, open_people / denominator))
+    if ratio >= 0.999 and valid_people == face_people and open_people >= face_people:
+        return "100", 1.0
+    if ratio >= 0.9:
+        bucket = "90_99"
+    elif ratio >= 0.8:
+        bucket = "80_90"
+    elif ratio >= 0.5:
+        bucket = "50_80"
+    else:
+        bucket = "0_50"
+    return bucket, ratio
+
+
+def classify_sharpness_bucket(score: float) -> str:
+    if score < 5.0:
+        return "very_blurry"
+    if score < 12.0:
+        return "blurry"
+    if score < 22.0:
+        return "moderate"
+    if score < 35.0:
+        return "sharp"
+    return "very_sharp"
+
 
 _HOTKEY_STAR_COLOR = "#f5c518"
 _HOTKEY_COLOR_SWATCHES = {
@@ -780,16 +847,45 @@ class Photo:
     path: str
     timestamp: datetime
     filesize: int
+    file_mtime_ns: int = 0
     selected: bool = False
     rating: int = 0
     color_label: str = ""
-    
-    xmp_loaded: bool = False  
-    is_dirty: bool = False    
-    is_saving: bool = False   
-    version: int = 0          
-    saving_version: int = 0   
+
+    xmp_loaded: bool = False
+    is_dirty: bool = False
+    is_saving: bool = False
+    version: int = 0
+    saving_version: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    analysis_version: int = 0
+    analysis_at: float = 0.0
+    analysis_status: str = ""
+    analysis_error: str = ""
+    faces_count: int = 0
+    faces_with_eyes: int = 0
+    eyes_open_count: int = 0
+    eyes_open_ratio: float = 1.0
+    eyes_open_bucket: str = "100"
+    sharpness_score: float = 0.0
+    sharpness_bucket: str = "unknown"
+
+
+@dataclass
+class FilterState:
+    selected_only: bool = False
+    eye_buckets: Set[str] = field(default_factory=set)
+    sharpness_buckets: Set[str] = field(default_factory=set)
+
+    def copy(self) -> 'FilterState':
+        return FilterState(
+            selected_only=self.selected_only,
+            eye_buckets=set(self.eye_buckets),
+            sharpness_buckets=set(self.sharpness_buckets),
+        )
+
+    def is_active(self) -> bool:
+        return self.selected_only or bool(self.eye_buckets) or bool(self.sharpness_buckets)
 
     def update_xmp(self, data: Dict):
         """Update the in-memory state and set the dirty flag."""
@@ -832,7 +928,7 @@ class Catalog:
             return
 
     @staticmethod
-    def _entry_to_item(entry) -> Optional[Tuple[datetime, str, int]]:
+    def _entry_to_item(entry) -> Optional[Tuple[datetime, str, int, int]]:
         path = entry.path
         try:
             st = entry.stat(follow_symlinks=False)
@@ -845,12 +941,16 @@ class Catalog:
             sz = st.st_size if st is not None else os.path.getsize(path)
         except Exception:
             sz = 0
-        return dt, path, sz
+        try:
+            mtime_ns = getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9)) if st is not None else int(os.path.getmtime(path) * 1e9)
+        except Exception:
+            mtime_ns = 0
+        return dt, path, sz, mtime_ns
 
     def _index(self):
         app = QApplication.instance()
         progress = None
-        items: List[Tuple[datetime, str, int]] = []
+        items: List[Tuple[datetime, str, int, int]] = []
 
         def _create_progress_dialog(total: int = 0) -> QProgressDialog:
             parent = app.activeWindow() if app else None
@@ -906,7 +1006,7 @@ class Catalog:
         if progress:
             progress.close()
 
-        self.photos = [Photo(path=p, timestamp=dt, filesize=sz) for dt, p, sz in items]
+        self.photos = [Photo(path=p, timestamp=dt, filesize=sz, file_mtime_ns=mt) for dt, p, sz, mt in items]
 
     def total_photos(self) -> int:
         return len(self.photos)
@@ -1822,6 +1922,512 @@ class ExportWorker(QObject):
             dest_jpeg_count=dest_jpeg_count,
         )
 
+
+class AnalysisStore:
+    FILE_NAME = "analysis.json"
+
+    def __init__(self, root: str):
+        self.root = root
+        self.path = os.path.join(root, self.FILE_NAME)
+        self.data: Dict[str, Dict] = {}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except FileNotFoundError:
+            self.data = {}
+            return
+        except Exception:
+            print(f"Failed to load analysis data from {self.path}")
+            self.data = {}
+            return
+
+        if not isinstance(payload, dict):
+            self.data = {}
+            return
+        if payload.get("version") != ANALYSIS_VERSION:
+            self.data = {}
+            return
+
+        items = payload.get("items")
+        if isinstance(items, dict):
+            self.data = items
+        else:
+            self.data = {}
+
+    def save(self):
+        payload = {"version": ANALYSIS_VERSION, "items": self.data}
+        tmp_path = self.path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+            os.replace(tmp_path, self.path)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    def get(self, path: str) -> Optional[Dict]:
+        return self.data.get(path)
+
+    def update_many(self, results: Dict[str, Dict]):
+        for path, payload in results.items():
+            payload = dict(payload)
+            payload["version"] = ANALYSIS_VERSION
+            self.data[path] = payload
+        self.save()
+
+    def prune(self, valid_paths: Set[str]) -> List[str]:
+        removed: List[str] = []
+        for path in list(self.data.keys()):
+            if path not in valid_paths:
+                removed.append(path)
+                self.data.pop(path, None)
+        if removed:
+            self.save()
+        return removed
+
+
+class AnalysisWorker(QObject):
+    progress = Signal(int, int, float, str)
+    finished = Signal(dict, bool)
+    error = Signal(str, str)
+
+    def __init__(self, photos: List[Photo]):
+        super().__init__()
+        self.photos = photos
+        self._cancel_requested = threading.Event()
+        self._face_mesh = self._create_face_mesh()
+        self._ear_threshold = 0.28
+
+    @staticmethod
+    def _create_face_mesh():
+        if mp is None:
+            return None
+        try:
+            return mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                refine_landmarks=True,
+                max_num_faces=12,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        except Exception:
+            return None
+
+    def request_cancel(self):
+        self._cancel_requested.set()
+
+    @Slot()
+    def run(self):
+        results: Dict[str, Dict] = {}
+        total = len(self.photos)
+        start = time.perf_counter()
+        for index, photo in enumerate(self.photos, start=1):
+            if self._cancel_requested.is_set():
+                break
+            try:
+                payload = self._process_photo(photo)
+            except Exception as exc:
+                tb = traceback.format_exc()
+                message = str(exc)
+                self.error.emit(message, tb)
+                payload = self._build_error_payload(photo, message)
+            if payload is not None:
+                results[photo.path] = payload
+            elapsed = time.perf_counter() - start
+            name = os.path.basename(photo.path)
+            self.progress.emit(index, total, elapsed, name)
+        canceled = self._cancel_requested.is_set()
+        self.finished.emit(results, canceled)
+        if self._face_mesh is not None:
+            try:
+                self._face_mesh.close()
+            except Exception:
+                pass
+            self._face_mesh = None
+
+    def _process_photo(self, photo: Photo) -> Optional[Dict]:
+        if cv2 is None:
+            raise RuntimeError("OpenCV is not available for analysis")
+        if mp is None:
+            raise RuntimeError("MediaPipe is not available for analysis")
+        pil = load_half_pil(photo.path)
+        if pil is None:
+            pil = load_full_pil(photo.path)
+        if pil is None:
+            raise RuntimeError(f"Failed to decode image: {photo.path}")
+
+        rgb = np.array(pil.convert('RGB'))
+        if rgb.size == 0:
+            raise RuntimeError(f"Empty image data: {photo.path}")
+
+        h, w = rgb.shape[:2]
+        max_side = max(h, w)
+        scale = 1.0
+        if max_side > 1280:
+            scale = 1280.0 / float(max_side)
+        if scale != 1.0:
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            resized = rgb
+
+        faces_count, open_count, valid_faces = self._detect_eyes(resized)
+
+        gray_focus = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        focus_score = self._measure_sharpness(gray_focus)
+
+        eye_bucket, ratio = classify_eye_bucket(open_count, faces_count, valid_faces)
+        sharp_bucket = classify_sharpness_bucket(focus_score)
+
+        payload = {
+            'filesize': photo.filesize,
+            'timestamp': photo.timestamp.isoformat(),
+            'mtime_ns': photo.file_mtime_ns,
+            'analysis_at': time.time(),
+            'status': 'ok',
+            'error_message': '',
+            'faces_count': faces_count,
+            'faces_with_eyes': valid_faces,
+            'eyes_open_count': open_count,
+            'eyes_open_ratio': ratio,
+            'eyes_open_bucket': eye_bucket,
+            'sharpness_score': float(focus_score),
+            'sharpness_bucket': sharp_bucket,
+            'analysis_version': ANALYSIS_VERSION,
+        }
+        return payload
+
+    def _build_error_payload(self, photo: Photo, message: str) -> Dict:
+        return {
+            'filesize': photo.filesize,
+            'timestamp': photo.timestamp.isoformat(),
+            'mtime_ns': photo.file_mtime_ns,
+            'analysis_at': time.time(),
+            'status': 'error',
+            'error_message': message,
+            'faces_count': 0,
+            'faces_with_eyes': 0,
+            'eyes_open_count': 0,
+            'eyes_open_ratio': 0.0,
+            'eyes_open_bucket': 'error',
+            'sharpness_score': 0.0,
+            'sharpness_bucket': 'unknown',
+            'analysis_version': ANALYSIS_VERSION,
+        }
+
+    def _detect_eyes(self, rgb_image: np.ndarray) -> Tuple[int, int, int]:
+        if self._face_mesh is None:
+            raise RuntimeError("MediaPipe Face Mesh is not available for analysis")
+
+        if rgb_image.ndim != 3 or rgb_image.shape[2] != 3:
+            return 0, 0, 0
+
+        # MediaPipe expects RGB float arrays marked as not writeable.
+        frame = np.ascontiguousarray(rgb_image)
+        frame.flags.writeable = False
+        results = self._face_mesh.process(frame)
+        if not results.multi_face_landmarks:
+            return 0, 0, 0
+
+        h, w = frame.shape[:2]
+        total_faces = len(results.multi_face_landmarks)
+        valid_faces = 0
+        open_faces = 0
+
+        for landmarks in results.multi_face_landmarks:
+            left_ear = self._compute_eye_aspect_ratio(landmarks, self._LEFT_EYE_IDXS, w, h)
+            right_ear = self._compute_eye_aspect_ratio(landmarks, self._RIGHT_EYE_IDXS, w, h)
+
+            ears = [ear for ear in (left_ear, right_ear) if ear is not None and np.isfinite(ear)]
+            if not ears:
+                continue
+
+            valid_faces += 1
+            avg_ear = float(sum(ears) / len(ears))
+            if avg_ear >= self._ear_threshold:
+                open_faces += 1
+
+        return total_faces, open_faces, valid_faces
+
+    _LEFT_EYE_IDXS = (33, 160, 158, 133, 153, 144)
+    _RIGHT_EYE_IDXS = (362, 385, 387, 263, 373, 380)
+
+    @staticmethod
+    def _compute_eye_aspect_ratio(landmarks, indices: Tuple[int, ...], width: int, height: int) -> Optional[float]:
+        try:
+            pts = [landmarks.landmark[i] for i in indices]
+        except Exception:
+            return None
+
+        coords = []
+        for pt in pts:
+            if pt is None:
+                return None
+            if not np.isfinite(pt.x) or not np.isfinite(pt.y):
+                return None
+            coords.append(np.array([pt.x * width, pt.y * height], dtype=np.float32))
+
+        if len(coords) != 6:
+            return None
+
+        p1, p2, p3, p4, p5, p6 = coords
+        horizontal = np.linalg.norm(p1 - p4)
+        if horizontal < 1e-4:
+            return None
+        vertical = np.linalg.norm(p2 - p6) + np.linalg.norm(p3 - p5)
+        ear = vertical / (2.0 * horizontal)
+        if not np.isfinite(ear):
+            return None
+        return float(ear)
+
+    def _measure_sharpness(self, gray_image: np.ndarray) -> float:
+        if gray_image.size == 0:
+            return 0.0
+        max_side = max(gray_image.shape[:2])
+        if max_side > 2048:
+            scale = 2048.0 / float(max_side)
+            new_w = max(1, int(round(gray_image.shape[1] * scale)))
+            new_h = max(1, int(round(gray_image.shape[0] * scale)))
+            gray_image = cv2.resize(gray_image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        gray = gray_image.astype(np.float32) / 255.0
+        # Suppress sensor noise before measuring edge strength.
+        gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0, sigmaY=1.0)
+
+        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        magnitude = cv2.magnitude(grad_x, grad_y)
+
+        # Focus on the sharpest regions by pooling local maxima.
+        magnitude = cv2.GaussianBlur(magnitude, (0, 0), sigmaX=1.5, sigmaY=1.5)
+        magnitude = cv2.dilate(magnitude, np.ones((5, 5), dtype=np.float32))
+
+        score = float(np.percentile(magnitude, 99.7)) * 100.0
+        if not np.isfinite(score):
+            return 0.0
+        return score
+
+
+class FilterDialog(QDialog):
+    filter_changed = Signal(FilterState)
+    process_requested = Signal()
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setWindowTitle("Filters")
+        self.setModal(False)
+        self.setMinimumWidth(420)
+
+        self._state = FilterState()
+        self._block_updates = False
+        self._analysis_ready = False
+        self._processing = False
+        self._pending_count = 0
+        self._analysis_supported = True
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(16)
+
+        self.selected_checkbox = QCheckBox("Show selected photos only", self)
+        self.selected_checkbox.stateChanged.connect(self._on_selected_toggled)
+        layout.addWidget(self.selected_checkbox)
+
+        self.eye_group = QGroupBox("Eyes open ratio", self)
+        eye_layout = QVBoxLayout()
+        self.eye_checkboxes: Dict[str, QCheckBox] = {}
+        for bucket, label in OPEN_EYE_BUCKETS:
+            cb = QCheckBox(label, self.eye_group)
+            cb.stateChanged.connect(lambda state, b=bucket: self._on_eye_toggled(b, state))
+            self.eye_checkboxes[bucket] = cb
+            eye_layout.addWidget(cb)
+        self.eye_group.setLayout(eye_layout)
+        layout.addWidget(self.eye_group)
+
+        self.sharp_group = QGroupBox("Sharpness", self)
+        sharp_layout = QVBoxLayout()
+        self.sharp_checkboxes: Dict[str, QCheckBox] = {}
+        for bucket, label in SHARPNESS_BUCKETS:
+            cb = QCheckBox(label, self.sharp_group)
+            cb.stateChanged.connect(lambda state, b=bucket: self._on_sharpness_toggled(b, state))
+            self.sharp_checkboxes[bucket] = cb
+            sharp_layout.addWidget(cb)
+        self.sharp_group.setLayout(sharp_layout)
+        layout.addWidget(self.sharp_group)
+
+        self.analysis_notice = QLabel("", self)
+        self.analysis_notice.setWordWrap(True)
+        layout.addWidget(self.analysis_notice)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+
+        self.process_button = QPushButton("Process", self)
+        self.process_button.clicked.connect(self._on_process_clicked)
+        button_row.addWidget(self.process_button)
+
+        self.reset_button = QPushButton("Reset Filters", self)
+        self.reset_button.clicked.connect(self._on_reset_clicked)
+        button_row.addWidget(self.reset_button)
+
+        button_row.addStretch(1)
+
+        close_button = QPushButton("Close", self)
+        close_button.clicked.connect(self.close)
+        button_row.addWidget(close_button)
+
+        layout.addLayout(button_row)
+
+    def set_state(
+        self,
+        state: FilterState,
+        counts: Dict[str, Dict[str, int]],
+        *,
+        analysis_ready: bool,
+        pending_count: int,
+        processing: bool,
+        analysis_supported: bool = True,
+    ):
+        self._state = state.copy()
+        self._analysis_ready = analysis_ready
+        self._pending_count = pending_count
+        self._processing = processing
+        self._analysis_supported = analysis_supported
+        self._apply_counts(counts)
+        self._sync_ui()
+
+    def _apply_counts(self, counts: Dict[str, Dict[str, int]]):
+        eye_counts = counts.get('eyes', {}) if counts else {}
+        for bucket, cb in self.eye_checkboxes.items():
+            label = OPEN_EYE_BUCKET_LABELS.get(bucket, bucket)
+            count = eye_counts.get(bucket, 0)
+            cb.setText(f"{label} ({count})")
+
+        sharp_counts = counts.get('sharpness', {}) if counts else {}
+        for bucket, cb in self.sharp_checkboxes.items():
+            label = SHARPNESS_BUCKET_LABELS.get(bucket, bucket)
+            count = sharp_counts.get(bucket, 0)
+            cb.setText(f"{label} ({count})")
+
+        unprocessed = counts.get('unprocessed', 0) if counts else 0
+        error_count = eye_counts.get('error', 0)
+        if not self._analysis_supported:
+            for cb in self.eye_checkboxes.values():
+                cb.setEnabled(False)
+            for cb in self.sharp_checkboxes.values():
+                cb.setEnabled(False)
+            self.analysis_notice.setText(
+                "Install opencv-python-headless and mediapipe to enable eye openness and sharpness filters."
+            )
+            self.process_button.setEnabled(False)
+            return
+
+        for cb in self.eye_checkboxes.values():
+            cb.setEnabled(True)
+        for cb in self.sharp_checkboxes.values():
+            cb.setEnabled(True)
+
+        if self._processing:
+            self.analysis_notice.setText("Processing analysis…")
+        elif not self._analysis_ready:
+            if self._pending_count > 0:
+                self.analysis_notice.setText(
+                    f"{self._pending_count} photo(s) require processing before eye and sharpness filters can be used."
+                )
+            elif unprocessed > 0:
+                self.analysis_notice.setText(
+                    f"{unprocessed} photo(s) do not yet have analysis data."
+                )
+            else:
+                self.analysis_notice.setText("Analysis is required before using eye or sharpness filters.")
+        else:
+            self.analysis_notice.setText("Filters are ready. Adjust the options above.")
+
+        self.process_button.setEnabled(not self._processing)
+
+        if error_count > 0:
+            extra = f"{error_count} photo(s) failed to analyze. Use the filters above to review them."
+            current = self.analysis_notice.text() or ""
+            if extra not in current:
+                if current:
+                    current = current + "\n" + extra
+                else:
+                    current = extra
+                self.analysis_notice.setText(current)
+
+    def _sync_ui(self):
+        self._block_updates = True
+        try:
+            self.selected_checkbox.setChecked(self._state.selected_only)
+            for bucket, cb in self.eye_checkboxes.items():
+                cb.setChecked(bucket in self._state.eye_buckets)
+            for bucket, cb in self.sharp_checkboxes.items():
+                cb.setChecked(bucket in self._state.sharpness_buckets)
+        finally:
+            self._block_updates = False
+        self.reset_button.setEnabled(self._state.is_active())
+
+    def _on_selected_toggled(self, state: int):
+        if self._block_updates:
+            return
+        self._state.selected_only = bool(state)
+        self.reset_button.setEnabled(self._state.is_active())
+        self.filter_changed.emit(self._state.copy())
+
+    def _on_eye_toggled(self, bucket: str, state: int):
+        if self._block_updates:
+            return
+        if not self._analysis_ready:
+            self._prompt_analysis_required()
+            self._sync_ui()
+            return
+        if state:
+            self._state.eye_buckets.add(bucket)
+        else:
+            self._state.eye_buckets.discard(bucket)
+        self.reset_button.setEnabled(self._state.is_active())
+        self.filter_changed.emit(self._state.copy())
+
+    def _on_sharpness_toggled(self, bucket: str, state: int):
+        if self._block_updates:
+            return
+        if not self._analysis_ready:
+            self._prompt_analysis_required()
+            self._sync_ui()
+            return
+        if state:
+            self._state.sharpness_buckets.add(bucket)
+        else:
+            self._state.sharpness_buckets.discard(bucket)
+        self.reset_button.setEnabled(self._state.is_active())
+        self.filter_changed.emit(self._state.copy())
+
+    def _on_process_clicked(self):
+        self.process_requested.emit()
+
+    def _on_reset_clicked(self):
+        if not self._state.is_active():
+            return
+        self._state = FilterState()
+        self._sync_ui()
+        self.filter_changed.emit(self._state.copy())
+
+    def _prompt_analysis_required(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("Analysis required")
+        box.setIcon(QMessageBox.Information)
+        box.setText("Eye openness and sharpness filters require processing. Run analysis now?")
+        process_button = box.addButton("Process Now", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        if box.clickedButton() is process_button:
+            self.process_requested.emit()
 class CullingWidget(QWidget):
     status_message = Signal(str, int)
     export_requested = Signal()
@@ -1839,7 +2445,11 @@ class CullingWidget(QWidget):
         self.meta_left = QLabel(); self.meta_left.setObjectName('metaLeft')
         self.meta_left.setText("")
 
-        self.badge_filter = QLabel("All Photos"); self.badge_filter.setObjectName("badgeGhost")
+        self.badge_filter = QPushButton("Filter"); self.badge_filter.setObjectName("badgeGhost")
+        self.badge_filter.setFlat(True)
+        self.badge_filter.setCursor(Qt.PointingHandCursor)
+        self.badge_filter.setFocusPolicy(Qt.NoFocus)
+        self.badge_filter.clicked.connect(self.show_filter_dialog)
         self.badge_selected = QLabel("Selected: 0"); self.badge_selected.setObjectName("badge")
         self.badge_zebra =   QLabel("Zebra OFF");    self.badge_zebra.setObjectName("badgeGhost")
         self.badge_hdr   =   QLabel("HDR OFF");      self.badge_hdr.setObjectName("badgeGhost")
@@ -1868,7 +2478,18 @@ class CullingWidget(QWidget):
 
         self.catalog = Catalog(root)
         self.idx = 0
-        self.selected_view_only = False
+        self.filter_state = FilterState()
+        self._analysis_store = AnalysisStore(root)
+        self._analysis_pending_paths: Set[str] = set()
+        self._analysis_thread: Optional[QThread] = None
+        self._analysis_worker: Optional[AnalysisWorker] = None
+        self._analysis_progress_dialog: Optional[QProgressDialog] = None
+        self._analysis_start_time: float = 0.0
+        self._analysis_average_seconds: float = 1.2
+        self._filter_dialog: Optional[FilterDialog] = None
+        self._filter_counts: Dict[str, Dict[str, int]] = {}
+        self._photo_by_path: Dict[str, Photo] = {}
+        self._analysis_supported = (cv2 is not None) and (mp is not None)
 
         self.pil_full_cache: OrderedDict[str, Image.Image] = OrderedDict()
         self.pil_half_cache: OrderedDict[str, Image.Image] = OrderedDict()
@@ -1907,7 +2528,8 @@ class CullingWidget(QWidget):
         self._full_running = 0
 
         self.selections_path = os.path.join(root, 'selections.json')
-        self._load_selections() 
+        self._load_selections()
+        self._initialize_analysis_state()
 
         self.autosave_timer = QTimer(self); self.autosave_timer.setSingleShot(True)
         self.autosave_interval_timer = QTimer(self)
@@ -1973,20 +2595,29 @@ class CullingWidget(QWidget):
             QLabel#metaLeft {{
                 color:{theme_color('text.primary')};
             }}
-            QLabel#badge, QLabel#badgeGhost {{
+            QLabel#badge, QLabel#badgeGhost, QPushButton#badge, QPushButton#badgeGhost {{
                 padding:4px 10px;
                 border-radius:999px;
                 font-size:10pt;
             }}
-            QLabel#badge {{
+            QLabel#badge, QPushButton#badge {{
                 background:{theme_color('accent.muted')};
                 color:{theme_color('badge.text')};
                 border:1px solid {theme_color('accent.primary')};
             }}
-            QLabel#badgeGhost {{
+            QLabel#badgeGhost, QPushButton#badgeGhost {{
                 background:{theme_color('bg.surface')};
                 color:{theme_color('text.secondary')};
                 border:1px solid {theme_color('border.default')};
+            }}
+            QPushButton#badge, QPushButton#badgeGhost {{
+                min-height: 0px;
+            }}
+            QPushButton#badge:hover {{
+                background:{theme_color('accent.hover')};
+            }}
+            QPushButton#badgeGhost:hover {{
+                background:{theme_color('bg.elevated')};
             }}
         """)
 
@@ -2011,7 +2642,7 @@ class CullingWidget(QWidget):
             'help': self.show_help,
             'toggle_zebra': self.toggle_zebra,
             'toggle_hdr': self.toggle_hdr,
-            'toggle_selected_view': self.toggle_selected_view,
+            'show_filter_dialog': self.show_filter_dialog,
         }
         for name, callback in action_map.items():
             action = QAction(self)
@@ -2050,7 +2681,7 @@ class CullingWidget(QWidget):
         relevant_names = [
             *(f'rate_{i}' for i in range(1, 6)),
             'label_red', 'label_yellow', 'label_green', 'label_blue', 'label_purple',
-            'toggle_zebra', 'toggle_hdr', 'toggle_selected_view',
+            'toggle_zebra', 'toggle_hdr', 'show_filter_dialog',
         ]
 
         bindings: Dict[str, List[QAction]] = {}
@@ -2073,20 +2704,45 @@ class CullingWidget(QWidget):
     def _update_filter_badge(self):
         if getattr(self, 'badge_filter', None) is None:
             return
-        if self.selected_view_only:
-            self.badge_filter.setText("Selected Only")
-            self.badge_filter.setObjectName("badge")
-        else:
-            self.badge_filter.setText("All Photos")
-            self.badge_filter.setObjectName("badgeGhost")
+        parts: List[str] = []
+        if self.filter_state.selected_only:
+            parts.append("Selected")
+        if self.filter_state.eye_buckets:
+            parts.append("Eyes")
+        if self.filter_state.sharpness_buckets:
+            parts.append("Sharpness")
+        text = "Filter"
+        if parts:
+            text += ": " + ", ".join(parts)
+        if self._analysis_pending_paths:
+            text += f" ({len(self._analysis_pending_paths)} to process)"
+        self.badge_filter.setText(text)
+        self.badge_filter.setObjectName("badge" if self.filter_state.is_active() else "badgeGhost")
         self.badge_filter.style().unpolish(self.badge_filter); self.badge_filter.style().polish(self.badge_filter)
 
     def _active_indices(self) -> List[int]:
         if not self.catalog.photos:
             return []
-        if not self.selected_view_only:
+        indices: List[int] = []
+        for idx, photo in enumerate(self.catalog.photos):
+            if self.filter_state.selected_only and not photo.selected:
+                continue
+            if self.filter_state.eye_buckets:
+                if photo.analysis_version != ANALYSIS_VERSION or photo.analysis_at <= 0:
+                    continue
+                if photo.eyes_open_bucket not in self.filter_state.eye_buckets:
+                    continue
+            if self.filter_state.sharpness_buckets:
+                if photo.analysis_version != ANALYSIS_VERSION or photo.analysis_at <= 0:
+                    continue
+                if photo.sharpness_bucket not in self.filter_state.sharpness_buckets:
+                    continue
+            indices.append(idx)
+        if indices:
+            return indices
+        if not self.filter_state.is_active():
             return list(range(len(self.catalog.photos)))
-        return [i for i, ph in enumerate(self.catalog.photos) if ph.selected]
+        return []
 
     def _current_position(self, indices: Optional[List[int]] = None) -> int:
         indices = indices if indices is not None else self._active_indices()
@@ -2098,26 +2754,25 @@ class CullingWidget(QWidget):
             return -1
 
     def _update_view_after_selection_change(self, reference_index: Optional[int] = None):
-        if not self.selected_view_only:
+        indices = self._active_indices()
+        if indices:
+            if self.idx in indices:
+                return
+            ref = reference_index if reference_index is not None else self.idx
+            if reference_index is not None and reference_index in indices:
+                self.idx = reference_index
+                return
+            next_idx = next((i for i in indices if i >= ref), None)
+            self.idx = next_idx if next_idx is not None else indices[0]
             return
 
-        indices = [i for i, ph in enumerate(self.catalog.photos) if ph.selected]
-        if not indices:
-            self.selected_view_only = False
+        if self.filter_state.selected_only and not any(p.selected for p in self.catalog.photos):
+            self.filter_state.selected_only = False
             self._update_filter_badge()
+            self._refresh_filter_dialog()
             self._show_toast("No selected photos - showing all photos")
             if self.catalog.photos:
                 self.idx = max(0, min(self.idx, len(self.catalog.photos) - 1))
-            return
-
-        if self.idx in indices:
-            return
-
-        ref = reference_index if reference_index is not None else self.idx
-        next_idx = next((i for i in indices if i >= ref), None)
-        if next_idx is None:
-            next_idx = indices[-1]
-        self.idx = next_idx
 
     def eventFilter(self, obj, ev: QEvent):
         if ev.type() in (QEvent.Type.KeyPress, QEvent.Type.Wheel, QEvent.Type.MouseButtonPress):
@@ -2242,7 +2897,102 @@ class CullingWidget(QWidget):
             f"preserved_metadata={preserved_metadata}, restored={restores}, "
             f"cleared_pending={cleared_pending}"
         )
-        
+
+    def _initialize_analysis_state(self):
+        self._photo_by_path = {p.path: p for p in self.catalog.photos}
+        valid_paths = set(self._photo_by_path.keys())
+        self._analysis_store.prune(valid_paths)
+        pending: Set[str] = set()
+        for path, photo in self._photo_by_path.items():
+            payload = self._analysis_store.get(path)
+            if payload and self._analysis_entry_matches(photo, payload):
+                self._apply_analysis_payload(photo, payload)
+            else:
+                pending.add(path)
+        self._analysis_pending_paths = pending
+        self._update_filter_counts()
+
+    def _analysis_entry_matches(self, photo: Photo, payload: Dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        version = payload.get('analysis_version', payload.get('version'))
+        if version != ANALYSIS_VERSION:
+            return False
+        if int(payload.get('filesize', -1)) != photo.filesize:
+            return False
+        if int(payload.get('mtime_ns', -1)) != photo.file_mtime_ns:
+            return False
+        stored_ts = payload.get('timestamp')
+        if stored_ts:
+            try:
+                stored_dt = datetime.fromisoformat(stored_ts)
+            except Exception:
+                stored_dt = None
+            if stored_dt is not None:
+                delta = abs((stored_dt - photo.timestamp).total_seconds())
+                if delta > 1.0:
+                    return False
+        return True
+
+    def _apply_analysis_payload(self, photo: Photo, payload: Dict):
+        photo.analysis_version = int(payload.get('analysis_version', payload.get('version', 0)) or 0)
+        photo.analysis_at = float(payload.get('analysis_at') or 0.0)
+        photo.analysis_status = payload.get('status') or 'ok'
+        photo.analysis_error = payload.get('error_message') or ''
+        photo.faces_count = int(payload.get('faces_count') or 0)
+        photo.faces_with_eyes = int(payload.get('faces_with_eyes') or 0)
+        photo.eyes_open_count = int(payload.get('eyes_open_count') or 0)
+        bucket = payload.get('eyes_open_bucket') or '100'
+        ratio = float(payload.get('eyes_open_ratio') or 0.0)
+        if photo.analysis_status == 'error':
+            bucket = 'error'
+            ratio = 0.0
+        else:
+            bucket, ratio = classify_eye_bucket(
+                photo.eyes_open_count,
+                photo.faces_count,
+                photo.faces_with_eyes,
+            )
+        photo.eyes_open_bucket = bucket
+        photo.eyes_open_ratio = ratio
+        photo.sharpness_score = float(payload.get('sharpness_score') or 0.0)
+        if photo.analysis_status == 'error':
+            photo.sharpness_bucket = payload.get('sharpness_bucket') or 'unknown'
+        else:
+            photo.sharpness_bucket = payload.get('sharpness_bucket') or classify_sharpness_bucket(photo.sharpness_score)
+
+    def _analysis_ready(self) -> bool:
+        return not self._analysis_pending_paths
+
+    def _update_filter_counts(self):
+        eye_counts = {key: 0 for key, _ in OPEN_EYE_BUCKETS}
+        sharp_counts = {key: 0 for key, _ in SHARPNESS_BUCKETS}
+        unprocessed = 0
+        for photo in self.catalog.photos:
+            if photo.analysis_version != ANALYSIS_VERSION or photo.analysis_at <= 0:
+                unprocessed += 1
+                continue
+            eye_counts[photo.eyes_open_bucket] = eye_counts.get(photo.eyes_open_bucket, 0) + 1
+            sharp_counts[photo.sharpness_bucket] = sharp_counts.get(photo.sharpness_bucket, 0) + 1
+        self._filter_counts = {
+            'eyes': eye_counts,
+            'sharpness': sharp_counts,
+            'unprocessed': unprocessed,
+        }
+        self._refresh_filter_dialog()
+
+    def _refresh_filter_dialog(self):
+        if not self._filter_dialog:
+            return
+        self._filter_dialog.set_state(
+            self.filter_state,
+            self._filter_counts,
+            analysis_ready=self._analysis_ready(),
+            pending_count=len(self._analysis_pending_paths),
+            processing=self._analysis_thread is not None,
+            analysis_supported=self._analysis_supported,
+        )
+
     def _update_selected_badge_fast(self):
         total_sel = sum(1 for x in self.catalog.photos if x.selected)
         self.badge_selected.setText(f"Selected: {total_sel}")
@@ -2643,21 +3393,157 @@ class CullingWidget(QWidget):
         self.badge_hdr.style().unpolish(self.badge_hdr); self.badge_hdr.style().polish(self.badge_hdr)
         self._show_temporary_status(f"Faux HDR Preview: {'ON' if self.hdr_toggled else 'OFF'}", 1000)
 
-    def toggle_selected_view(self):
-        self.selected_view_only = not self.selected_view_only
-        indices = self._active_indices()
-        if self.selected_view_only and not indices:
-            self.selected_view_only = False
-            self._show_toast("No selected photos to display")
-            self._update_filter_badge()
-            return
-        if indices:
-            if self.idx not in indices:
-                self.idx = indices[0]
+    def show_filter_dialog(self):
+        if self._filter_dialog is None:
+            self._filter_dialog = FilterDialog(self)
+            self._filter_dialog.filter_changed.connect(self._on_filter_changed)
+            self._filter_dialog.process_requested.connect(self._on_filter_process_requested)
+        self._refresh_filter_dialog()
+        self._filter_dialog.show()
+        self._filter_dialog.raise_()
+        self._filter_dialog.activateWindow()
+
+    def _on_filter_changed(self, state: FilterState):
+        self.filter_state = state.copy()
         self._update_filter_badge()
+        self._update_view_after_selection_change()
         self._show_current()
         self._heavy_load_scheduler.start()
-        self._show_toast("Showing selected photos only" if self.selected_view_only else "Showing all photos")
+        self._update_filmstrip()
+        self._refresh_statusbar()
+        self._refresh_filter_dialog()
+
+    def _on_filter_process_requested(self):
+        self._start_analysis_processing()
+
+    def _pending_analysis_photos(self) -> List[Photo]:
+        return [self._photo_by_path[path] for path in self._analysis_pending_paths if path in self._photo_by_path]
+
+    def _start_analysis_processing(self, *, force: bool = False):
+        if self._analysis_thread is not None:
+            if self._analysis_progress_dialog:
+                self._analysis_progress_dialog.show()
+                self._analysis_progress_dialog.raise_()
+            return
+
+        if not self._analysis_supported:
+            self._show_toast(
+                "Analysis requires OpenCV and MediaPipe. Install opencv-python-headless and mediapipe to enable this feature."
+            )
+            return
+
+        targets = list(self._photo_by_path.values()) if force else self._pending_analysis_photos()
+        if not targets:
+            self._show_toast("Analysis is already up to date")
+            return
+
+        self._analysis_worker = AnalysisWorker(targets)
+        self._analysis_thread = QThread(self)
+        self._analysis_worker.moveToThread(self._analysis_thread)
+        self._analysis_thread.started.connect(self._analysis_worker.run)
+        self._analysis_worker.progress.connect(self._on_analysis_progress)
+        self._analysis_worker.finished.connect(self._on_analysis_finished)
+        self._analysis_worker.error.connect(self._on_analysis_error)
+
+        self._analysis_progress_dialog = QProgressDialog("Processing analysis…", "Cancel", 0, len(targets), self)
+        self._analysis_progress_dialog.setWindowModality(Qt.WindowModal)
+        self._analysis_progress_dialog.setMinimumDuration(0)
+        self._analysis_progress_dialog.setValue(0)
+        self._analysis_progress_dialog.canceled.connect(self._cancel_analysis_processing)
+        self._analysis_start_time = time.perf_counter()
+
+        self._analysis_thread.start()
+        self._update_filter_badge()
+        self._refresh_filter_dialog()
+
+    def _cancel_analysis_processing(self):
+        if self._analysis_worker:
+            self._analysis_worker.request_cancel()
+
+    @Slot(int, int, float, str)
+    def _on_analysis_progress(self, completed: int, total: int, elapsed: float, name: str):
+        if not self._analysis_progress_dialog:
+            return
+        dlg = self._analysis_progress_dialog
+        dlg.setMaximum(max(total, 1))
+        dlg.setValue(min(completed, total))
+        if completed <= 0 or total <= 0:
+            dlg.setLabelText("Processing analysis…")
+            return
+        avg = elapsed / max(completed, 1)
+        self._analysis_average_seconds = (self._analysis_average_seconds * 0.6) + (avg * 0.4)
+        remaining = max(0, total - completed)
+        eta = int(round(self._analysis_average_seconds * remaining))
+        label = f"Processing analysis… ({completed}/{total})"
+        if eta > 0:
+            label += f"  ~{eta}s remaining"
+        dlg.setLabelText(label)
+
+    @Slot(dict, bool)
+    def _on_analysis_finished(self, results: Dict[str, Dict], canceled: bool):
+        if self._analysis_progress_dialog:
+            try:
+                self._analysis_progress_dialog.reset()
+            except Exception:
+                pass
+            self._analysis_progress_dialog = None
+
+        self._finalize_analysis_thread()
+
+        if results:
+            self._apply_analysis_results(results)
+            self._show_toast(f"Analysis completed for {len(results)} photo(s)")
+        elif canceled:
+            self._show_toast("Analysis canceled")
+        else:
+            self._show_toast("Analysis finished")
+
+    @Slot(str, str)
+    def _on_analysis_error(self, message: str, tb: str):
+        print("Analysis error:", message)
+        if tb:
+            print(tb)
+        self._show_toast("Failed to analyze some photos")
+
+    def _finalize_analysis_thread(self):
+        worker = self._analysis_worker
+        thread = self._analysis_thread
+        self._analysis_worker = None
+        self._analysis_thread = None
+        if worker:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+        if thread:
+            try:
+                thread.quit()
+                thread.wait()
+                thread.deleteLater()
+            except Exception:
+                pass
+        self._refresh_filter_dialog()
+        self._update_filter_badge()
+
+    def _apply_analysis_results(self, results: Dict[str, Dict]):
+        if not results:
+            return
+        updated: Dict[str, Dict] = {}
+        for path, payload in results.items():
+            photo = self._photo_by_path.get(path)
+            if not photo:
+                continue
+            self._apply_analysis_payload(photo, payload)
+            self._analysis_pending_paths.discard(path)
+            updated[path] = payload
+        if updated:
+            self._analysis_store.update_many(updated)
+        self._update_filter_counts()
+        self._update_filter_badge()
+        self._update_view_after_selection_change()
+        self._show_current()
+        self._update_filmstrip()
+        self._refresh_statusbar()
 
     def _show_temporary_status(self, message: str, timeout: int = 1000):
         self.status_restore_timer.stop()
@@ -2807,7 +3693,14 @@ class CullingWidget(QWidget):
         current_num = (pos + 1) if pos >= 0 else (self.idx + 1)
         total_sel = sum(1 for x in self.catalog.photos if x.selected)
         self.badge_selected.setText(f"Selected: {total_sel}")
-        view_scope = "sel" if self.selected_view_only else "all"
+        scope_parts: List[str] = []
+        if self.filter_state.selected_only:
+            scope_parts.append("sel")
+        if self.filter_state.eye_buckets:
+            scope_parts.append("eyes")
+        if self.filter_state.sharpness_buckets:
+            scope_parts.append("sharp")
+        view_scope = ",".join(scope_parts) if scope_parts else "all"
         msg = f"[{current_num}/{total} {view_scope}]  Selected: {total_sel}  {os.path.basename(p.path)}  |  workers: {self._num_workers}"
         self.status_message.emit(msg, 0)
 
@@ -2816,7 +3709,10 @@ class CullingWidget(QWidget):
         indices = self._active_indices()
         if not indices:
             self.meta_left.setText("")
-            self.view.setText("No images")
+            if self.filter_state.is_active():
+                self.view.setText("No photos match the active filters")
+            else:
+                self.view.setText("No images")
             self.filmstrip.set_items([])
             self._refresh_statusbar()
             return
@@ -3222,6 +4118,18 @@ class CullingWidget(QWidget):
         except Exception:
             pass
 
+        try:
+            self._cancel_analysis_processing()
+        except Exception:
+            pass
+        if self._analysis_progress_dialog:
+            try:
+                self._analysis_progress_dialog.reset()
+            except Exception:
+                pass
+            self._analysis_progress_dialog = None
+        self._finalize_analysis_thread()
+
         self.save_all_dirty_files()
         self._flush_queue()
 
@@ -3379,7 +4287,7 @@ class SettingsDialog(QDialog):
             'unselect': 'Unselect Image:',
             'toggle_zebra': 'Toggle Zebra/Histogram:',
             'toggle_hdr': 'Toggle Faux HDR Preview:',
-            'toggle_selected_view': 'Show Selected Only:',
+            'show_filter_dialog': 'Open Filter Panel:',
             'rate_1': '1★ Rating:',
             'rate_2': '2★ Rating:',
             'rate_3': '3★ Rating:',
