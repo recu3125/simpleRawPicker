@@ -34,6 +34,7 @@ from PySide6.QtCore import (
     QElapsedTimer,
     QStandardPaths,
     QThread,
+    QMetaObject,
 )
 from PySide6.QtGui import (
     QPixmap,
@@ -3215,12 +3216,28 @@ class CullingWidget(QWidget):
             for ev in wait_events:
                 ev.wait()
 
-    def cleanup(self):
+    @Slot()
+    def _cleanup_qt_objects(self):
         try:
             self.autosave_timer.stop()
+        except Exception:
+            pass
+        try:
             self.autosave_interval_timer.stop()
         except Exception:
             pass
+        try:
+            app = QApplication.instance()
+            if app:
+                app.removeEventFilter(self)
+        except Exception:
+            pass
+
+    def cleanup(self):
+        if QThread.currentThread() != self.thread():
+            QMetaObject.invokeMethod(self, "_cleanup_qt_objects", Qt.BlockingQueuedConnection)
+        else:
+            self._cleanup_qt_objects()
 
         self.save_all_dirty_files()
         self._flush_queue()
@@ -3236,7 +3253,6 @@ class CullingWidget(QWidget):
                 t.join(timeout=0.5)
         except Exception:
             pass
-        QApplication.instance().removeEventFilter(self)
 
               
 class KeySequenceEdit(QLineEdit):
@@ -4071,6 +4087,28 @@ class WelcomeWidget(QWidget):
         QTimer.singleShot(0, self._reflow)
 
 
+class _ExportCleanupWorker(QObject):
+    finished = Signal(object)
+    error = Signal(str, str)
+
+    def __init__(self, task: Callable[[ExportResult], Optional[ExportResult]], result: ExportResult):
+        super().__init__()
+        self._task = task
+        self._result = result
+
+    @Slot()
+    def run(self):
+        try:
+            finalized = self._task(self._result)
+            if finalized is None:
+                finalized = self._result
+            self.finished.emit(finalized)
+        except Exception as exc:
+            details = traceback.format_exc()
+            message = f"Finalizing export failed: {exc}"
+            self.error.emit(message, details)
+
+
 class AppWindow(QMainWindow):
     def __init__(self, args):
         super().__init__()
@@ -4090,6 +4128,9 @@ class AppWindow(QMainWindow):
         self._export_success_callback: Optional[Callable[[ExportResult], None]] = None
         self._export_error_callback: Optional[Callable[[str], None]] = None
         self._export_cancel_callback: Optional[Callable[[], None]] = None
+        self._cleanup_thread: Optional[QThread] = None
+        self._cleanup_worker: Optional[_ExportCleanupWorker] = None
+        self._pending_culling_teardown: Optional[CullingWidget] = None
 
         self.app_data_path = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
         os.makedirs(self.app_data_path, exist_ok=True)
@@ -4401,29 +4442,74 @@ class AppWindow(QMainWindow):
             dialog.repaint()
             QApplication.processEvents()
 
-        try:
-            finalized = finalizer(result)
-            return finalized if finalized is not None else result
-        except Exception as exc:
-            details = traceback.format_exc()
-            message = f"Finalizing export failed: {exc}"
-            self._on_export_error(message, details)
-            return None
-        finally:
-            self._export_finalizing = False
+        worker = _ExportCleanupWorker(finalizer, result)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_cleanup_worker_finished)
+        worker.error.connect(self._on_cleanup_worker_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(self._on_cleanup_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+
+        self._cleanup_thread = thread
+        self._cleanup_worker = worker
+        thread.start()
+        return None
 
     def _on_export_finished(self, result: ExportResult):
         finalized_result = self._execute_export_finalizer(result)
         if finalized_result is None:
             return
 
+        self._complete_export_success(finalized_result)
+
+    def _complete_export_success(self, finalized_result: ExportResult, *, finalize_state: bool = True):
         callback = self._export_success_callback
-        self._finalize_export_state()
+        if finalize_state:
+            self._finalize_export_state()
         self._export_success_callback = None
         self._export_error_callback = None
         self._export_cancel_callback = None
         if callback:
             callback(finalized_result)
+
+    def _on_cleanup_worker_finished(self, finalized_result: ExportResult):
+        self._cleanup_worker = None
+        self._export_finalizing = False
+        self._finalize_export_state()
+        self._teardown_culling_session_after_cleanup()
+        self._complete_export_success(finalized_result, finalize_state=False)
+
+    def _on_cleanup_worker_error(self, message: str, details: str):
+        self._cleanup_worker = None
+        self._pending_culling_teardown = None
+        self._export_finalizing = False
+        self._on_export_error(message, details)
+
+    def _on_cleanup_thread_finished(self):
+        self._cleanup_thread = None
+
+    def _teardown_culling_session_after_cleanup(self):
+        cw = self._pending_culling_teardown
+        if cw:
+            try:
+                if self.stack.indexOf(cw) != -1:
+                    self.stack.removeWidget(cw)
+            except Exception:
+                pass
+            cw.deleteLater()
+        self._pending_culling_teardown = None
+        self.culling_widget = None
+
+        self._load_app_state()
+        self.welcome_screen.update_recent_folders(self.recent_folders)
+        self.stack.setCurrentWidget(self.welcome_screen)
+        self.update_toolbar_state(is_culling=False)
+        self.status.clearMessage()
 
     def _on_export_error(self, message: str, details: str):
         print(f"[Export] Error: {message}\n{details}", file=sys.stderr)
@@ -4486,16 +4572,8 @@ class AppWindow(QMainWindow):
         def finalize(result: ExportResult) -> ExportResult:
             cw = self.culling_widget
             if cw:
+                self._pending_culling_teardown = cw
                 cw.cleanup()
-                self.stack.removeWidget(cw)
-                cw.deleteLater()
-                self.culling_widget = None
-
-            self._load_app_state()
-            self.welcome_screen.update_recent_folders(self.recent_folders)
-            self.stack.setCurrentWidget(self.welcome_screen)
-            self.update_toolbar_state(is_culling=False)
-            self.status.clearMessage()
             return result
 
         self._perform_export(
