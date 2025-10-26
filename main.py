@@ -103,7 +103,7 @@ DEFAULT_HOTKEYS = OrderedDict([
     ('toggle_zebra', 'Q'),
     ('toggle_hdr', 'E'),
     ('toggle_selected_view', 'F'),
-    ('save', ''),
+    # ('save', ''),
     ('export', 'Ctrl+S'),
     ('help', 'F1'),
     ('quit', ''),
@@ -1966,7 +1966,7 @@ class CullingWidget(QWidget):
     def _create_actions(self):
         self.actions: Dict[str, QAction] = {}
         action_map = {
-            'save': self.save_all_dirty_files,
+            # 'save': self.save_all_dirty_files,
             'quit': self.window().close,
             'next': self.next_photo,
             'prev': self.prev_photo,
@@ -3206,6 +3206,7 @@ class CullingWidget(QWidget):
               
 class KeySequenceEdit(QLineEdit):
     _active_capture_widget: Optional['KeySequenceEdit'] = None
+    _collected_keys: List[str] = []  # Store multiple keys
 
     def __init__(self, key_sequence_str: str, parent=None):
         super().__init__(key_sequence_str, parent)
@@ -3226,8 +3227,9 @@ class KeySequenceEdit(QLineEdit):
         if self._is_capturing:
             return
         self.setText("")
-        self.setPlaceholderText("Press a key or key combination...")
+        self.setPlaceholderText("Press keys, then Enter to confirm or Escape to cancel...")
         self._is_capturing = True
+        self._collected_keys = []  # Reset collected keys
         KeySequenceEdit._active_capture_widget = self
         try:
             self.grabKeyboard()
@@ -3238,6 +3240,7 @@ class KeySequenceEdit(QLineEdit):
         if not self._is_capturing:
             return
         self._is_capturing = False
+        self._collected_keys = []  # Clear collected keys
         if KeySequenceEdit._active_capture_widget is self:
             KeySequenceEdit._active_capture_widget = None
         try:
@@ -3264,6 +3267,15 @@ class KeySequenceEdit(QLineEdit):
         if key in (Qt.Key_unknown, Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
             return
 
+        # Exit on Escape (cancel) or Enter (confirm)
+        if key == Qt.Key_Escape:
+            self.setText("")  # Clear on cancel
+            self._exit_capture_mode()
+            return
+        if key == Qt.Key_Return or key == Qt.Key_Enter:
+            self._exit_capture_mode()
+            return
+
         key_sequence = QKeySequence(event.keyCombination())
         text = key_sequence.toString(QKeySequence.NativeText)
 
@@ -3281,21 +3293,25 @@ class KeySequenceEdit(QLineEdit):
         if not text:
             return
 
-        current_text = self.text()
-        if current_text:
-            self.setText(f"{current_text}, {text}")
-        else:
-            self.setText(text)
-
-        self._exit_capture_mode()
+        # Add to collected keys and update display
+        if text not in self._collected_keys:  # Avoid duplicates
+            self._collected_keys.append(text)
+            self.setText(", ".join(self._collected_keys))
+        
+        # Don't exit capture mode - keep collecting keys
+        # User must press Enter/Escape or click outside to finish
         event.accept()
 
+    def keyReleaseEvent(self, event: QEvent):
+        if self._is_capturing:
+            event.accept()
 class SettingsDialog(QDialog):
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.settings = settings
         self.hotkey_edits: Dict[str, 'KeySequenceEdit'] = {}
+        self._parent_window = parent  # Store parent for accessing toast method
 
         main_layout = QVBoxLayout(self)
         
@@ -3339,7 +3355,7 @@ class SettingsDialog(QDialog):
             'label_green': 'Label Green:',
             'label_blue': 'Label Blue:',
             'label_purple': 'Label Purple:',
-            'save': 'Save Selections:',
+            # 'save': 'Save Selections:',
             'export': 'Save Progress:',
             'help': 'Show Help:',
             'quit': 'Quit Application:'
@@ -3387,6 +3403,12 @@ class SettingsDialog(QDialog):
             hotkey_layout.addWidget(label, row, base_col)
             hotkey_layout.addWidget(edit, row, base_col + 1)
             self.hotkey_edits[action] = edit
+            
+            # Connect to check for conflicts when editing finishes
+            edit.editingFinished.connect(
+                lambda action=action: self._check_hotkey_conflicts(action)
+            )
+            edit.textChanged.connect(lambda text, action=action: self._on_hotkey_changed(action, text))
 
         for column in range(columns):
             hotkey_layout.setColumnStretch(column * 2, 0)
@@ -3395,21 +3417,164 @@ class SettingsDialog(QDialog):
         hotkey_group.setLayout(hotkey_layout)
         main_layout.addWidget(hotkey_group)
 
-        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+
+        restore_button = QPushButton("Restore Default Hotkeys")
+        restore_button.setObjectName("SecondaryButton")
+        restore_button.setStyleSheet(f"""
+            QPushButton#SecondaryButton {{
+                background-color: {theme_color('bg.surface')};
+                color: {theme_color('text.secondary')};
+                border: 1px solid {theme_color('border.default')};
+                border-radius: 4px;
+                padding: 8px 16px;
+            }}
+            QPushButton#SecondaryButton:hover {{
+                background-color: {theme_color('bg.elevated')};
+            }}
+            QPushButton#SecondaryButton:pressed {{
+                background-color: {theme_color('bg.base')};
+            }}
+        """)
+        restore_button.clicked.connect(self.restore_defaults)
+        main_layout.addWidget(restore_button)
+        
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok)
         self.button_box.accepted.connect(self.accept)
-        self.button_box.rejected.connect(self.reject)
         main_layout.addWidget(self.button_box)
 
+    def _on_hotkey_changed(self, action: str, text: str):
+        """Real-time conflict checking as user types"""
+        if not text:
+            # Clear any warning styling when field is empty
+            edit = self.hotkey_edits.get(action)
+            if edit:
+                edit.setStyleSheet("")
+                edit.setToolTip("")
+            return
+            
+        # Check if this shortcut conflicts with other actions
+        conflicting_action = self._find_conflicting_action(action, text)
+        if conflicting_action:
+            # Show conflict warning but don't clear the field yet
+            # Let the user decide what to do
+            edit = self.hotkey_edits.get(action)
+            if edit:
+                edit.setStyleSheet("QLineEdit { background-color: #5c3c3c; border: 1px solid #ff5f5f; }")  # Red background
+                conflict_label = conflicting_action.replace('_', ' ').title()
+                edit.setToolTip(f"Conflicts with '{conflict_label}'")
+        else:
+            # Clear any warning styling if no conflict
+            edit = self.hotkey_edits.get(action)
+            if edit:
+                edit.setStyleSheet("")
+                edit.setToolTip("")
+
+    def _check_hotkey_conflicts(self, current_action: str):
+        """Check for conflicts when editing is finished"""
+        current_edit = self.hotkey_edits.get(current_action)
+        if not current_edit:
+            return
+            
+        current_keys = current_edit.text().strip()
+        if not current_keys:
+            # Clear styling when empty
+            current_edit.setStyleSheet("")
+            current_edit.setToolTip("")
+            return
+            
+        # Find conflicts
+        conflicting_action = self._find_conflicting_action(current_action, current_keys)
+        if conflicting_action:
+            # Show toast message about conflict
+            self._show_conflict_toast(current_action, conflicting_action, current_keys)
+            # Clear the conflicting shortcut
+            current_edit.setText("")
+            current_edit.setStyleSheet("")
+            current_edit.setToolTip("")
+
+    def _find_conflicting_action(self, current_action: str, keys: str) -> Optional[str]:
+        """Find if the given keys conflict with any other action"""
+        # Split the keys by comma and normalize
+        current_key_list = [k.strip() for k in keys.split(',') if k.strip()]
+        
+        for action, edit in self.hotkey_edits.items():
+            if action == current_action:
+                continue
+                
+            other_keys = edit.text().strip()
+            if not other_keys:
+                continue
+                
+            # Check for any overlap between key lists
+            other_key_list = [k.strip() for k in other_keys.split(',') if k.strip()]
+            
+            # Check if any key appears in both lists
+            for key in current_key_list:
+                if key in other_key_list:
+                    return action
+                    
+        return None
+
+    def _show_conflict_toast(self, action1: str, action2: str, keys: str):
+        """Show a toast message about shortcut conflict"""
+        action2_label = action2.replace('_', ' ').title()
+        msg = f"Shortcut '{keys}' conflicts with '{action2_label}'"
+        # Try to use parent's toast method if available
+        if hasattr(self._parent_window, '_show_toast'):
+            self._parent_window._show_toast(msg, 3000)
+        else:
+            # Fallback to message box if no toast available
+            QMessageBox.warning(self, "Shortcut Conflict", msg)
+
+    def restore_defaults(self):
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("Restore Defaults")
+        msg.setText("Are you sure you want to restore all hotkeys to their default values?")
+
+        restore_btn = msg.addButton("Restore", QMessageBox.AcceptRole)
+        cancel_btn  = msg.addButton("Cancel",  QMessageBox.RejectRole)
+
+        # Cancel을 덜 강조
+        cancel_btn.setObjectName("GhostButton")
+        cancel_btn.setAutoDefault(False)
+        cancel_btn.setDefault(False)
+        cancel_btn.setStyleSheet(f"""
+            QPushButton#GhostButton {{
+                background-color: {theme_color('bg.surface')};
+                color: {theme_color('text.secondary')};
+                border: 1px solid {theme_color('border.default')};
+                border-radius: 4px;
+                padding: 6px 12px;
+            }}
+            QPushButton#GhostButton:hover {{
+                background-color: {theme_color('bg.elevated')};
+            }}
+            QPushButton#GhostButton:pressed {{
+                background-color: {theme_color('bg.base')};
+            }}
+        """)
+
+        # Restore를 기본값으로
+        restore_btn.setDefault(True)
+        restore_btn.setAutoDefault(True)
+
+        msg.exec()
+
+        if msg.clickedButton() is restore_btn:
+            for action, default_value in DEFAULT_HOTKEYS.items():
+                if action in self.hotkey_edits:
+                    self.hotkey_edits[action].setText(default_value)
+                    
     def accept(self):
         self.settings.autosave_interval_min = self.autosave_spinbox.value()
-        self.settings.raw_output_folder_name = self.raw_output_folder_edit.text() or "_selected_raw"
-        self.settings.jpeg_output_folder_name = self.jpeg_output_folder_edit.text() or "_selected_jpeg"
-
+        self.settings.raw_output_folder_name = self.raw_output_folder_edit.text() or '_selected_raw'
+        self.settings.jpeg_output_folder_name = self.jpeg_output_folder_edit.text() or '_selected_jpeg'
+        
         for action, edit in self.hotkey_edits.items():
             self.settings.hotkeys[action] = edit.text()
-
+        
         super().accept()
-
 class CompletionDialog(QDialog):
     def __init__(self, title: str,
                 selected_count: int,
