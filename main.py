@@ -831,46 +831,81 @@ class Catalog:
             print(f"Warning: Directory not found: {self.root}")
             return
 
+    @staticmethod
+    def _entry_to_item(entry) -> Optional[Tuple[datetime, str, int]]:
+        path = entry.path
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except Exception:
+            st = None
+        dt = read_exif_datetime(path, st)
+        if not dt:
+            return None
+        try:
+            sz = st.st_size if st is not None else os.path.getsize(path)
+        except Exception:
+            sz = 0
+        return dt, path, sz
+
     def _index(self):
-        entries = list(self._iter_files())
-        total = len(entries)
-        progress = None
         app = QApplication.instance()
-        if app and total >= 200:
-            parent = app.activeWindow()
-            progress = QProgressDialog("Indexing photos…", "", 0, total, parent)
-            progress.setCancelButton(None)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
+        progress = None
+        items: List[Tuple[datetime, str, int]] = []
+
+        def _create_progress_dialog(total: int = 0) -> QProgressDialog:
+            parent = app.activeWindow() if app else None
+            dlg = QProgressDialog("Indexing photos…", "", 0, total, parent)
+            dlg.setCancelButton(None)
+            dlg.setWindowModality(Qt.WindowModal)
+            dlg.setMinimumDuration(0)
+            return dlg
+
+        if app:
+            progress = _create_progress_dialog()
+            progress.setRange(0, 0)
             progress.setValue(0)
             progress.show()
             QApplication.processEvents()
 
-        items: List[Tuple[datetime, str, int]] = []
-        for idx, entry in enumerate(entries, start=1):
-            path = entry.path
-            try:
-                st = entry.stat(follow_symlinks=False)
-            except Exception:
-                st = None
-            dt = read_exif_datetime(path, st)
-            if not dt:
-                continue
-            try:
-                sz = st.st_size if st is not None else os.path.getsize(path)
-            except Exception:
-                sz = 0
-            items.append((dt, path, sz))
+        total = 0
+        for total, _ in enumerate(self._iter_files(), start=1):
+            if progress and progress.maximum() == 0:
+                progress.setLabelText(f"Indexing photos… ({total} files found)")
+                if total % 25 == 0:
+                    QApplication.processEvents()
+
+        if total == 0:
             if progress:
-                if progress.wasCanceled():
-                    break
-                progress.setValue(idx)
+                progress.setRange(0, 1)
+                progress.setValue(1)
                 QApplication.processEvents()
+                progress.close()
+            self.photos = []
+            return
+
+        if progress:
+            progress.setRange(0, total)
+            progress.setValue(0)
+            QApplication.processEvents()
+
+        processed = 0
+        for entry in self._iter_files():
+            item = self._entry_to_item(entry)
+            if item is not None:
+                items.append(item)
+            processed += 1
+            if progress:
+                if progress.maximum() != total:
+                    progress.setRange(0, total)
+                progress.setValue(processed)
+                if processed % 25 == 0 or processed == total:
+                    QApplication.processEvents()
+
+        items.sort(key=lambda x: x[0])
 
         if progress:
             progress.close()
 
-        items.sort(key=lambda x: x[0])
         self.photos = [Photo(path=p, timestamp=dt, filesize=sz) for dt, p, sz in items]
 
     def total_photos(self) -> int:
