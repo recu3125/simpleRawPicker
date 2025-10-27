@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, sys, io, json, time, shutil, argparse, traceback
+import os, sys, io, json, time, shutil, argparse, traceback, subprocess
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, List, Dict, Optional, Tuple, Set
@@ -10,11 +10,6 @@ from collections import OrderedDict
 from queue import PriorityQueue, Empty
 from contextlib import contextmanager
 from html import escape as _h
-
-try:
-    import exiv2
-except Exception:
-    exiv2 = None
 
 import numpy as np
 from PIL import Image, ImageQt, ImageOps
@@ -152,6 +147,32 @@ SHARPNESS_BUCKET_LABELS = {key: label for key, label in SHARPNESS_BUCKETS}
 ANALYSIS_VERSION = 2
 
 
+def _resolve_exiftool_path() -> Optional[str]:
+    candidates: List[str] = []
+    env_path = os.environ.get('EXIFTOOL_PATH') or os.environ.get('exiftool_path')
+    if env_path:
+        candidates.append(env_path)
+    candidates.extend([
+        'exiftool',
+        'exiftool.exe',
+        'exiftool(-k).exe',
+    ])
+    for cand in candidates:
+        if not cand:
+            continue
+        if os.path.isabs(cand):
+            if os.path.exists(cand) and os.access(cand, os.X_OK):
+                return cand
+        else:
+            resolved = shutil.which(cand)
+            if resolved:
+                return resolved
+    return None
+
+
+EXIFTOOL_PATH = _resolve_exiftool_path()
+
+
 def classify_eye_bucket(open_people: int, face_people: int, valid_people: Optional[int] = None) -> Tuple[str, float]:
     if face_people <= 0:
         return "no_faces", 0.0
@@ -247,6 +268,16 @@ def _styled_hotkey_label(action: str, fallback_text: str) -> Tuple[str, bool]:
     return fallback_text, False
 
 _XMP_GLOBAL_LOCK = threading.Lock()
+
+_XMP_MINIMAL_TEMPLATE = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" \
+    "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n" \
+    "  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n" \
+    "    <rdf:Description rdf:about=\"\"\n" \
+    "      xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n" \
+    "      xmlns:photoshop=\"http://ns.adobe.com/photoshop/1.0/\">\n" \
+    "    </rdf:Description>\n" \
+    "  </rdf:RDF>\n" \
+    "</x:xmpmeta>\n"""
 class HotkeyDialog(QDialog):
     def __init__(self, parent: QWidget, hotkeys: Dict[str, str]):
         super().__init__(parent)
@@ -477,9 +508,21 @@ class HotkeyDialog(QDialog):
         )
 
 
+def _ensure_xmp_file_exists(xmp_path: str):
+    if os.path.exists(xmp_path):
+        return
+    base_dir = os.path.dirname(xmp_path)
+    if base_dir and not os.path.exists(base_dir):
+        os.makedirs(base_dir, exist_ok=True)
+    with open(xmp_path, 'w', encoding='utf-8') as f:
+        f.write(_XMP_MINIMAL_TEMPLATE)
+
+
 def read_xmp_sidecar(path: str) -> Dict:
     """Reads rating, label, and pick status from an XMP sidecar file."""
-    if exiv2 is None: return {}
+    if EXIFTOOL_PATH is None:
+        return {}
+
     xmp_path = os.path.splitext(path)[0] + '.xmp'
 
     with _XMP_GLOBAL_LOCK:
@@ -487,82 +530,117 @@ def read_xmp_sidecar(path: str) -> Dict:
             if not os.path.exists(xmp_path) or os.path.getsize(xmp_path) == 0:
                 return {}
         except FileNotFoundError:
-            return {} 
+            return {}
+        except Exception:
+            return {}
 
-        for attempt in range(3):
+        try:
+            proc = subprocess.run(
+                [EXIFTOOL_PATH, '-j', '-XMP:Rating', '-XMP:Label', '-XMP-photoshop:Urgency', xmp_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as e:
+            print(f"Warning: Could not read XMP for {os.path.basename(path)}: {e}")
+            return {}
+
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return {}
+
+        try:
+            payload = json.loads(proc.stdout)
+        except Exception as e:
+            print(f"Warning: Failed to parse XMP JSON for {os.path.basename(path)}: {e}")
+            return {}
+
+        if not isinstance(payload, list) or not payload:
+            return {}
+
+        entry = payload[0]
+        data: Dict[str, object] = {}
+
+        rating_val = entry.get('XMP:Rating') or entry.get('Rating')
+        if rating_val not in (None, ''):
             try:
-                img = exiv2.ImageFactory.open(xmp_path)
-                img.readMetadata()
-                xmp = img.xmpData()
-                
-                data = {}
-                if 'Xmp.xmp.Rating' in xmp:
-                    data['rating'] = int(xmp['Xmp.xmp.Rating'].print())
-                if 'Xmp.xmp.Label' in xmp:
-                    data['color_label'] = xmp['Xmp.xmp.Label'].print()
-                if 'Xmp.photoshop.Urgency' in xmp:
-                    urgency_val = int(xmp['Xmp.photoshop.Urgency'].print())
-                    data['selected'] = urgency_val == 1
-                return data
-            except exiv2.Exiv2Error as e:
-                if e.code == 21 and attempt < 2: 
-                    time.sleep(0.05)
-                    continue
-                print(f"Warning: Could not read XMP for {os.path.basename(path)}: {e}")
-                return {}
-            except Exception as e:
-                print(f"Warning: Unexpected error reading XMP for {os.path.basename(path)}: {e}")
-                return {}
-        return {}
+                data['rating'] = int(str(rating_val))
+            except Exception:
+                pass
+
+        label_val = entry.get('XMP:Label') or entry.get('Label')
+        if label_val not in (None, ''):
+            data['color_label'] = str(label_val)
+
+        urgency_val = (
+            entry.get('XMP-photoshop:Urgency')
+            or entry.get('Photoshop:Urgency')
+            or entry.get('Urgency')
+        )
+        if urgency_val not in (None, ''):
+            try:
+                urgency_int = int(str(urgency_val))
+                data['selected'] = urgency_int == 1 or urgency_int > 0
+            except Exception:
+                pass
+
+        return data
 
 def write_xmp_sidecar(path: str, data: Dict):
     """Writes rating, label, or pick status to an XMP sidecar file."""
-    if exiv2 is None: return False
+    if EXIFTOOL_PATH is None:
+        return False
     xmp_path = os.path.splitext(path)[0] + '.xmp'
 
     with _XMP_GLOBAL_LOCK:
         try:
-            raw_img = exiv2.ImageFactory.open(path)
-            raw_img.readMetadata()
-            
-            if os.path.exists(xmp_path):
-                try:
-                    sidecar_img = exiv2.ImageFactory.open(xmp_path)
-                    sidecar_img.readMetadata()
-                    raw_img.setXmpData(sidecar_img.xmpData())
-                except Exception:
-                    pass
+            _ensure_xmp_file_exists(xmp_path)
+        except Exception as e:
+            print(f"Error preparing XMP sidecar for {os.path.basename(path)}: {e}")
+            return False
 
-            xmp = raw_img.xmpData()
+        cmd: List[str] = [
+            EXIFTOOL_PATH,
+            '-overwrite_original',
+            '-P',
+            '-m',
+        ]
 
-            if 'rating' in data and data['rating'] is not None:
-                rating_val = int(data['rating'])
-                if rating_val == 0 and 'Xmp.xmp.Rating' in xmp:
-                     xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Rating')))
-                elif rating_val > 0:
-                    xmp['Xmp.xmp.Rating'] = str(rating_val)
-            
-            if 'color_label' in data:
-                label_val = data['color_label']
-                if label_val:
-                    xmp['Xmp.xmp.Label'] = str(label_val)
-                elif 'Xmp.xmp.Label' in xmp:
-                    xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Label')))
+        rating_val = data.get('rating') if 'rating' in data else None
+        if rating_val is not None:
+            try:
+                rating_int = int(rating_val)
+                if rating_int <= 0:
+                    cmd.append('-XMP:Rating=')
+                else:
+                    cmd.append(f'-XMP:Rating={rating_int}')
+            except Exception:
+                pass
 
-            if 'selected' in data and data['selected'] is not None:
-                is_selected = data['selected']
-                urgency_key_str = 'Xmp.photoshop.Urgency'
-                
-                if is_selected:
-                    xmp[urgency_key_str] = '1'
-                elif urgency_key_str in xmp:
-                    xmp[urgency_key_str] = '0'
+        if 'color_label' in data:
+            label_val = data.get('color_label')
+            if label_val:
+                cmd.append(f'-XMP:Label={label_val}')
+            else:
+                cmd.append('-XMP:Label=')
 
-            with open(xmp_path, 'w', encoding='utf-8') as f:
-                f.write(raw_img.xmpPacket())
+        if 'selected' in data and data['selected'] is not None:
+            cmd.append(f"-XMP-photoshop:Urgency={'1' if data['selected'] else '0'}")
 
+        if len(cmd) == 4:
+            return True
+
+        cmd.append(xmp_path)
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         except Exception as e:
             print(f"Error writing XMP for {os.path.basename(path)}: {e}")
+            return False
+
+        if proc.returncode != 0:
+            stderr = proc.stderr.strip() if proc.stderr else ''
+            if stderr:
+                print(f"Error writing XMP for {os.path.basename(path)}: {stderr}")
             return False
 
     return True
@@ -765,36 +843,88 @@ def _jpeg_exif_as_meta(path: str) -> Dict[str, str]:
     _exif_to_meta(exif, meta)
     return meta
 
-def _exiv2_read_meta_text(path: str) -> Dict[str, str]:
-    if exiv2 is None:
+def _exiftool_read_meta_text(path: str) -> Dict[str, str]:
+    if EXIFTOOL_PATH is None:
         return {}
+
+    tags = [
+        '-Make',
+        '-Model',
+        '-LensModel',
+        '-Lens',
+        '-LensID',
+        '-LensSpec',
+        '-LensInfo',
+        '-FNumber',
+        '-ApertureValue',
+        '-ExposureTime',
+        '-ShutterSpeedValue',
+        '-ISO',
+        '-PhotographicSensitivity',
+        '-FocalLength',
+        '-DateTimeOriginal',
+        '-CreateDate',
+        '-ModifyDate',
+    ]
+
     try:
-        img = exiv2.ImageFactory.open(path)
-        img.readMetadata()
-        exif = img.exifData()
-        xmp  = img.xmpData()
-        def gp(*keys) -> str:
-            for k in keys:
-                try:
-                    if k in exif:
-                        return exif[k].print()
-                    if k in xmp:
-                        return xmp[k].print()
-                except Exception:
-                    pass
-            return ""
-        meta: Dict[str, str] = {}
-        meta['make']   = gp("Exif.Image.Make")
-        meta['model']  = gp("Exif.Image.Model")
-        meta['lens']   = gp("Exif.Photo.LensModel", "Xmp.aux.Lens", "Xmp.exifEX.LensModel", "Xmp.aux.LensID")
-        meta['fnumber_text'] = gp("Exif.Photo.FNumber", "Exif.Photo.ApertureValue")
-        meta['exp_text']     = gp("Exif.Photo.ExposureTime", "Xmp.exif.ExposureTime")
-        meta['iso']    = gp("Exif.Photo.PhotographicSensitivity", "Exif.Photo.ISOSpeedRatings", "Xmp.exif.ISOSpeedRatings")
-        meta['fl']     = gp("Exif.Photo.FocalLength", "Xmp.exif.FocalLength")
-        meta['dt']     = gp("Exif.Photo.DateTimeOriginal", "Exif.Image.DateTime", "Xmp.exif.DateTimeOriginal", "Xmp.xmp.CreateDate")
-        return {k: v for k, v in meta.items() if v}
+        proc = subprocess.run(
+            [EXIFTOOL_PATH, '-j', *tags, path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     except Exception:
         return {}
+
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {}
+
+    try:
+        payload = json.loads(proc.stdout)
+    except Exception:
+        return {}
+
+    if not isinstance(payload, list) or not payload:
+        return {}
+
+    entry = payload[0]
+
+    def first(*keys) -> Optional[str]:
+        for key in keys:
+            val = entry.get(key)
+            if val not in (None, ''):
+                return str(val)
+        return None
+
+    meta: Dict[str, str] = {}
+    make = first('Make')
+    model = first('Model')
+    lens = first('LensModel', 'Lens', 'LensSpec', 'LensID', 'LensInfo')
+    fnumber = first('FNumber', 'ApertureValue')
+    exposure = first('ExposureTime', 'ShutterSpeedValue')
+    iso_val = first('PhotographicSensitivity', 'ISO')
+    focal = first('FocalLength')
+    dt_val = first('DateTimeOriginal', 'CreateDate', 'ModifyDate')
+
+    if make:
+        meta['make'] = make
+    if model:
+        meta['model'] = model
+    if lens:
+        meta['lens'] = lens
+    if fnumber:
+        meta['fnumber_text'] = fnumber
+    if exposure:
+        meta['exp_text'] = exposure
+    if iso_val:
+        meta['iso'] = iso_val
+    if focal:
+        meta['fl'] = focal
+    if dt_val:
+        meta['dt'] = dt_val
+
+    return meta
 
 def _raw_meta_as_meta(path: str) -> Dict[str, str]:
     meta: Dict[str, str] = {}
@@ -832,7 +962,7 @@ def _raw_meta_as_meta(path: str) -> Dict[str, str]:
                     pass
     except Exception:
         pass
-    ext = _exiv2_read_meta_text(path)
+    ext = _exiftool_read_meta_text(path)
     for k in ('make','model','lens','iso','fl','dt'):
         if not meta.get(k) and ext.get(k):
             meta[k] = ext[k]
@@ -2572,11 +2702,14 @@ class CullingWidget(QWidget):
 
         if not self.catalog.photos:
             QMessageBox.information(self, "Information", "No supported photo files found.")
-        elif exiv2 is None:
-            QMessageBox.warning(self, "XMP Features Disabled",
-                                "Could not find the py3exiv2 library.\n"
-                                "Rating and color label features are disabled.\n"
-                                "Please run `pip install py3exiv2` to install it.")
+        elif EXIFTOOL_PATH is None:
+            QMessageBox.warning(
+                self,
+                "XMP Features Disabled",
+                "Could not find the ExifTool command-line utility.\n"
+                "Rating and color label features are disabled.\n"
+                "Please install ExifTool from https://exiftool.org/ and ensure it is on your PATH.",
+            )
 
         self.setStyleSheet(f"""
             QWidget#card {{
@@ -3974,7 +4107,7 @@ class CullingWidget(QWidget):
                 self._update_selected_badge_fast()
             return
 
-        if exiv2 is None:
+        if EXIFTOOL_PATH is None:
             self._update_selected_badge_fast()
             return
 
@@ -4703,7 +4836,7 @@ class AboutDialog(QDialog):
             ("Pillow", "https://python-pillow.org"),
             ("NumPy", "https://numpy.org"),
             ("psutil", "https://github.com/giampaolo/psutil"),
-            ("libexiv2 (via python-exiv2)", "https://github.com/LeoHsiao1/python-exiv2"),
+            ("ExifTool", "https://exiftool.org"),
         ]
 
         oss_links = ", ".join(
