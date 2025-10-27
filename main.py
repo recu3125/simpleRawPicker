@@ -10,10 +10,15 @@ from collections import OrderedDict
 from queue import PriorityQueue, Empty
 from contextlib import contextmanager
 from html import escape as _h
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from PIL import Image, ImageQt, ImageOps
 import rawpy
+try:
+    import piexif
+except Exception:
+    piexif = None
 try:
     import cv2
 except Exception:
@@ -145,32 +150,6 @@ SHARPNESS_BUCKETS: List[Tuple[str, str]] = [
 SHARPNESS_BUCKET_LABELS = {key: label for key, label in SHARPNESS_BUCKETS}
 
 ANALYSIS_VERSION = 2
-
-
-def _resolve_exiftool_path() -> Optional[str]:
-    candidates: List[str] = []
-    env_path = os.environ.get('EXIFTOOL_PATH') or os.environ.get('exiftool_path')
-    if env_path:
-        candidates.append(env_path)
-    candidates.extend([
-        'exiftool',
-        'exiftool.exe',
-        'exiftool(-k).exe',
-    ])
-    for cand in candidates:
-        if not cand:
-            continue
-        if os.path.isabs(cand):
-            if os.path.exists(cand) and os.access(cand, os.X_OK):
-                return cand
-        else:
-            resolved = shutil.which(cand)
-            if resolved:
-                return resolved
-    return None
-
-
-EXIFTOOL_PATH = _resolve_exiftool_path()
 
 
 def classify_eye_bucket(open_people: int, face_people: int, valid_people: Optional[int] = None) -> Tuple[str, float]:
@@ -518,77 +497,83 @@ def _ensure_xmp_file_exists(xmp_path: str):
         f.write(_XMP_MINIMAL_TEMPLATE)
 
 
+_XMP_NS = {
+    'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+    'xmp': 'http://ns.adobe.com/xap/1.0/',
+    'photoshop': 'http://ns.adobe.com/photoshop/1.0/',
+}
+
+
+def _load_xmp_tree(xmp_path: str) -> ET.ElementTree:
+    try:
+        if os.path.exists(xmp_path) and os.path.getsize(xmp_path) > 0:
+            return ET.parse(xmp_path)
+    except Exception:
+        pass
+    return ET.ElementTree(ET.fromstring(_XMP_MINIMAL_TEMPLATE))
+
+
+def _get_xmp_description(root: ET.Element) -> ET.Element:
+    rdf = root.find('rdf:RDF', _XMP_NS)
+    if rdf is None:
+        rdf = ET.SubElement(root, f"{{{_XMP_NS['rdf']}}}RDF")
+    desc = rdf.find('rdf:Description', _XMP_NS)
+    if desc is None:
+        desc = ET.SubElement(rdf, f"{{{_XMP_NS['rdf']}}}Description")
+        desc.set(f"{{{_XMP_NS['rdf']}}}about", "")
+    return desc
+
+
 def read_xmp_sidecar(path: str) -> Dict:
     """Reads rating, label, and pick status from an XMP sidecar file."""
-    if EXIFTOOL_PATH is None:
-        return {}
-
     xmp_path = os.path.splitext(path)[0] + '.xmp'
 
     with _XMP_GLOBAL_LOCK:
         try:
             if not os.path.exists(xmp_path) or os.path.getsize(xmp_path) == 0:
                 return {}
-        except FileNotFoundError:
-            return {}
         except Exception:
             return {}
 
         try:
-            proc = subprocess.run(
-                [EXIFTOOL_PATH, '-j', '-XMP:Rating', '-XMP:Label', '-XMP-photoshop:Urgency', xmp_path],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            tree = ET.parse(xmp_path)
         except Exception as e:
-            print(f"Warning: Could not read XMP for {os.path.basename(path)}: {e}")
+            print(f"Warning: Could not parse XMP for {os.path.basename(path)}: {e}")
             return {}
 
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return {}
+    root = tree.getroot()
+    rdf = root.find('rdf:RDF', _XMP_NS)
+    if rdf is None:
+        return {}
+    desc = rdf.find('rdf:Description', _XMP_NS)
+    if desc is None:
+        return {}
+    data: Dict[str, object] = {}
 
+    rating_val = desc.attrib.get(f"{{{_XMP_NS['xmp']}}}Rating")
+    if rating_val not in (None, ''):
         try:
-            payload = json.loads(proc.stdout)
-        except Exception as e:
-            print(f"Warning: Failed to parse XMP JSON for {os.path.basename(path)}: {e}")
-            return {}
+            data['rating'] = int(str(rating_val))
+        except Exception:
+            pass
 
-        if not isinstance(payload, list) or not payload:
-            return {}
+    label_val = desc.attrib.get(f"{{{_XMP_NS['xmp']}}}Label")
+    if label_val not in (None, ''):
+        data['color_label'] = str(label_val)
 
-        entry = payload[0]
-        data: Dict[str, object] = {}
+    urgency_val = desc.attrib.get(f"{{{_XMP_NS['photoshop']}}}Urgency")
+    if urgency_val not in (None, ''):
+        try:
+            urgency_int = int(str(urgency_val))
+            data['selected'] = urgency_int == 1 or urgency_int > 0
+        except Exception:
+            pass
 
-        rating_val = entry.get('XMP:Rating') or entry.get('Rating')
-        if rating_val not in (None, ''):
-            try:
-                data['rating'] = int(str(rating_val))
-            except Exception:
-                pass
+    return data
 
-        label_val = entry.get('XMP:Label') or entry.get('Label')
-        if label_val not in (None, ''):
-            data['color_label'] = str(label_val)
-
-        urgency_val = (
-            entry.get('XMP-photoshop:Urgency')
-            or entry.get('Photoshop:Urgency')
-            or entry.get('Urgency')
-        )
-        if urgency_val not in (None, ''):
-            try:
-                urgency_int = int(str(urgency_val))
-                data['selected'] = urgency_int == 1 or urgency_int > 0
-            except Exception:
-                pass
-
-        return data
 
 def write_xmp_sidecar(path: str, data: Dict):
     """Writes rating, label, or pick status to an XMP sidecar file."""
-    if EXIFTOOL_PATH is None:
-        return False
     xmp_path = os.path.splitext(path)[0] + '.xmp'
 
     with _XMP_GLOBAL_LOCK:
@@ -598,49 +583,41 @@ def write_xmp_sidecar(path: str, data: Dict):
             print(f"Error preparing XMP sidecar for {os.path.basename(path)}: {e}")
             return False
 
-        cmd: List[str] = [
-            EXIFTOOL_PATH,
-            '-overwrite_original',
-            '-P',
-            '-m',
-        ]
+        try:
+            tree = _load_xmp_tree(xmp_path)
+        except Exception as e:
+            print(f"Error loading XMP template for {os.path.basename(path)}: {e}")
+            return False
+
+        root = tree.getroot()
+        desc = _get_xmp_description(root)
+
+        def _set_attr(ns: str, name: str, value: Optional[str]):
+            key = f"{{{_XMP_NS[ns]}}}{name}"
+            if value in (None, ''):
+                desc.attrib.pop(key, None)
+            else:
+                desc.set(key, str(value))
 
         rating_val = data.get('rating') if 'rating' in data else None
         if rating_val is not None:
             try:
                 rating_int = int(rating_val)
-                if rating_int <= 0:
-                    cmd.append('-XMP:Rating=')
-                else:
-                    cmd.append(f'-XMP:Rating={rating_int}')
+                _set_attr('xmp', 'Rating', str(rating_int) if rating_int > 0 else '')
             except Exception:
                 pass
 
         if 'color_label' in data:
             label_val = data.get('color_label')
-            if label_val:
-                cmd.append(f'-XMP:Label={label_val}')
-            else:
-                cmd.append('-XMP:Label=')
+            _set_attr('xmp', 'Label', label_val or '')
 
         if 'selected' in data and data['selected'] is not None:
-            cmd.append(f"-XMP-photoshop:Urgency={'1' if data['selected'] else '0'}")
-
-        if len(cmd) == 4:
-            return True
-
-        cmd.append(xmp_path)
+            _set_attr('photoshop', 'Urgency', '1' if data['selected'] else '0')
 
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            tree.write(xmp_path, encoding='utf-8', xml_declaration=True)
         except Exception as e:
             print(f"Error writing XMP for {os.path.basename(path)}: {e}")
-            return False
-
-        if proc.returncode != 0:
-            stderr = proc.stderr.strip() if proc.stderr else ''
-            if stderr:
-                print(f"Error writing XMP for {os.path.basename(path)}: {stderr}")
             return False
 
     return True
@@ -661,14 +638,97 @@ def _pow2(x):
     except (ValueError, TypeError):
         return None
 
-def _ratarr_to_tuple(v):
-    try:
-        return tuple(float(x) for x in v)
-    except Exception:
+def _coerce_to_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
         try:
-            return tuple(x.numerator / x.denominator for x in v)
+            return float(value)
+        except Exception:
+            if '/' in value:
+                num_den = value.split('/', 1)
+                if len(num_den) == 2:
+                    try:
+                        num = float(num_den[0])
+                        den = float(num_den[1])
+                        if den:
+                            return num / den
+                    except Exception:
+                        return None
+        return None
+    if hasattr(value, 'numerator') and hasattr(value, 'denominator'):
+        try:
+            den = float(value.denominator)
+            if den:
+                return float(value.numerator) / den
         except Exception:
             return None
+    if isinstance(value, tuple) and len(value) == 2:
+        num = _coerce_to_float(value[0])
+        den = _coerce_to_float(value[1])
+        if den:
+            return (num / den) if num is not None else None
+        return None
+    return None
+
+
+def _ratarr_to_tuple(v):
+    try:
+        values = []
+        for item in v:
+            val = _coerce_to_float(item)
+            if val is None:
+                return None
+            values.append(val)
+        return tuple(values)
+    except Exception:
+        return None
+
+
+def _format_fnumber(fval: float) -> Optional[str]:
+    val = _coerce_to_float(fval)
+    if val is None or val <= 0:
+        return None
+    s = f"{val:.1f}"
+    if s.endswith('.0'):
+        s = s[:-2]
+    return s
+
+
+def _format_exposure(seconds_val: float) -> Optional[str]:
+    seconds = _coerce_to_float(seconds_val)
+    if seconds is None or seconds <= 0:
+        return None
+    if seconds >= 1.0:
+        return f"{seconds:.3f}".rstrip('0').rstrip('.')
+    denom = round(1.0 / seconds)
+    if denom <= 0:
+        return f"{seconds:.4f}".rstrip('0').rstrip('.')
+    approx = 1.0 / denom
+    if abs(approx - seconds) < 1e-4:
+        return f"1/{denom}"
+    return f"{seconds:.4f}".rstrip('0').rstrip('.')
+
+
+class _PieExifAdapter:
+    def __init__(self, exif_dict: Dict):
+        self._map: Dict[int, object] = {}
+        for ifd_name in ('0th', 'Exif', '1st', 'Interop'):
+            ifd = exif_dict.get(ifd_name)
+            if not isinstance(ifd, dict):
+                continue
+            for tag, value in ifd.items():
+                if isinstance(value, bytes):
+                    try:
+                        value = value.decode('utf-8', 'ignore').strip('\x00')
+                    except Exception:
+                        pass
+                self._map[tag] = value
+
+    def get(self, tagid):
+        return self._map.get(tagid)
 
 def _exif_to_meta(exif, meta: Dict[str, str]):
     def get(tagid):
@@ -706,59 +766,51 @@ def _exif_to_meta(exif, meta: Dict[str, str]):
 
     fno = get(TAG['FNumber'])
     if fno is not None:
-        try:
-            f = float(fno) if isinstance(fno, (int, float)) else fno.numerator / fno.denominator
-            updf('fnumber', f"{f:.1f}")
-        except Exception:
-            pass
+        formatted = _format_fnumber(fno)
+        if formatted:
+            updf('fnumber', formatted)
+            updf('fnumber_text', f"f/{formatted}")
     if not meta.get('fnumber'):
         av = get(TAG['ApertureValue'])
-        try:
-            avf = float(av) if isinstance(av, (int, float)) else av.numerator / av.denominator
+        avf = _coerce_to_float(av)
+        if avf is not None:
             f = _pow2(avf / 2.0)
-            if f is not None:
-                updf('fnumber', f"{f:.1f}")
-        except Exception:
-            pass
+            formatted = _format_fnumber(f) if f is not None else None
+            if formatted:
+                updf('fnumber', formatted)
+                updf('fnumber_text', f"f/{formatted}")
 
     exp = get(TAG['ExposureTime'])
     if exp is not None:
-        try:
-            e = float(exp) if isinstance(exp, (int, float)) else exp.numerator / exp.denominator
-            if e >= 1:
-                s = f"{e:.3f}".rstrip('0').rstrip('.')
-            else:
-                denom = int(round(1.0 / e)) if e > 0 else None
-                s = f"1/{denom}" if denom else f"{e:.4f}".rstrip('0').rstrip('.')
+        s = _format_exposure(exp)
+        if s:
             updf('exp', s)
-        except Exception:
-            pass
+            updf('exp_text', s)
     if not meta.get('exp'):
         tv = get(TAG['ShutterSpeedValue'])
-        try:
-            tvf = float(tv) if isinstance(tv, (int, float)) else tv.numerator / tv.denominator
+        tvf = _coerce_to_float(tv)
+        if tvf is not None:
             t = _pow2(-tvf)
-            if t is not None:
-                if t >= 1:
-                    s = f"{t:.3f}".rstrip('0').rstrip('.')
-                else:
-                    denom = int(round(1.0 / t)) if t > 0 else None
-                    s = f"1/{denom}" if denom else f"{t:.4f}".rstrip('0').rstrip('.')
+            s = _format_exposure(t) if t is not None else None
+            if s:
                 updf('exp', s)
-        except Exception:
-            pass
+                updf('exp_text', s)
 
     iso = get(TAG['PhotographicSensitivity']) or get(TAG['ISOSpeedRatings'])
     if iso is not None:
-        updf('iso', str(iso))
+        if isinstance(iso, str):
+            iso_str = iso.strip()
+        else:
+            iso_val = _coerce_to_float(iso)
+            iso_str = f"{int(round(iso_val))}" if iso_val is not None else str(iso)
+        if iso_str:
+            updf('iso', iso_str)
 
     fl = get(TAG['FocalLength'])
     if fl is not None:
-        try:
-            val = float(fl) if isinstance(fl, (int, float)) else fl.numerator / fl.denominator
+        val = _coerce_to_float(fl)
+        if val is not None:
             updf('fl', f"{val:g}mm")
-        except Exception:
-            pass
 
     base = get(TAG['DateTimeOriginal']) or get(TAG['DateTimeDigitized']) or get(TAG['DateTime'])
     sub  = get(TAG['SubSecTimeOriginal']) or get(TAG['SubSecTimeDigitized']) or get(TAG['SubSecTime'])
@@ -838,92 +890,16 @@ def _estimate_pil_bytes(pil: Optional[Image.Image]) -> int:
 
 def _jpeg_exif_as_meta(path: str) -> Dict[str, str]:
     meta: Dict[str, str] = {}
+    if piexif is not None:
+        try:
+            exif_dict = piexif.load(path)
+            _exif_to_meta(_PieExifAdapter(exif_dict), meta)
+            return meta
+        except Exception:
+            pass
     img = _open_jpeg_transposed(path)
     exif = img.getexif()
     _exif_to_meta(exif, meta)
-    return meta
-
-def _exiftool_read_meta_text(path: str) -> Dict[str, str]:
-    if EXIFTOOL_PATH is None:
-        return {}
-
-    tags = [
-        '-Make',
-        '-Model',
-        '-LensModel',
-        '-Lens',
-        '-LensID',
-        '-LensSpec',
-        '-LensInfo',
-        '-FNumber',
-        '-ApertureValue',
-        '-ExposureTime',
-        '-ShutterSpeedValue',
-        '-ISO',
-        '-PhotographicSensitivity',
-        '-FocalLength',
-        '-DateTimeOriginal',
-        '-CreateDate',
-        '-ModifyDate',
-    ]
-
-    try:
-        proc = subprocess.run(
-            [EXIFTOOL_PATH, '-j', *tags, path],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except Exception:
-        return {}
-
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return {}
-
-    try:
-        payload = json.loads(proc.stdout)
-    except Exception:
-        return {}
-
-    if not isinstance(payload, list) or not payload:
-        return {}
-
-    entry = payload[0]
-
-    def first(*keys) -> Optional[str]:
-        for key in keys:
-            val = entry.get(key)
-            if val not in (None, ''):
-                return str(val)
-        return None
-
-    meta: Dict[str, str] = {}
-    make = first('Make')
-    model = first('Model')
-    lens = first('LensModel', 'Lens', 'LensSpec', 'LensID', 'LensInfo')
-    fnumber = first('FNumber', 'ApertureValue')
-    exposure = first('ExposureTime', 'ShutterSpeedValue')
-    iso_val = first('PhotographicSensitivity', 'ISO')
-    focal = first('FocalLength')
-    dt_val = first('DateTimeOriginal', 'CreateDate', 'ModifyDate')
-
-    if make:
-        meta['make'] = make
-    if model:
-        meta['model'] = model
-    if lens:
-        meta['lens'] = lens
-    if fnumber:
-        meta['fnumber_text'] = fnumber
-    if exposure:
-        meta['exp_text'] = exposure
-    if iso_val:
-        meta['iso'] = iso_val
-    if focal:
-        meta['fl'] = focal
-    if dt_val:
-        meta['dt'] = dt_val
-
     return meta
 
 def _raw_meta_as_meta(path: str) -> Dict[str, str]:
@@ -941,13 +917,30 @@ def _raw_meta_as_meta(path: str) -> Dict[str, str]:
                     iso   = getattr(m, 'iso_speed', None) or getattr(m, 'iso', None)
                     fl    = getattr(m, 'focal_length', None)
                     ts    = getattr(m, 'timestamp', None)
-                    if make:  meta['make']  = str(make)
-                    if model: meta['model'] = str(model)
-                    if lens:  meta['lens']  = str(lens)
-                    if fno and float(fno) > 0:   meta['fnumber'] = f"{float(fno):.1f}"
-                    if exp and float(exp) > 0:   meta['exp'] = f"{float(exp):.6f}".rstrip('0').rstrip('.')
-                    if iso and float(iso) > 0:   meta['iso'] = str(int(float(iso)))
-                    if fl  and float(fl)  > 0:   meta['fl']  = f"{float(fl):g}mm"
+                    if make:
+                        meta['make'] = str(make)
+                    if model:
+                        meta['model'] = str(model)
+                    if lens:
+                        meta['lens'] = str(lens)
+                    f_val = _coerce_to_float(fno)
+                    if f_val is not None and f_val > 0:
+                        f_text = _format_fnumber(f_val)
+                        if f_text:
+                            meta['fnumber'] = f_text
+                            meta['fnumber_text'] = f"f/{f_text}"
+                    exp_val = _coerce_to_float(exp)
+                    if exp_val is not None and exp_val > 0:
+                        exp_text = _format_exposure(exp_val)
+                        if exp_text:
+                            meta['exp'] = exp_text
+                            meta['exp_text'] = exp_text
+                    iso_val = _coerce_to_float(iso)
+                    if iso_val is not None and iso_val > 0:
+                        meta['iso'] = str(int(round(iso_val)))
+                    fl_val = _coerce_to_float(fl)
+                    if fl_val is not None and fl_val > 0:
+                        meta['fl'] = f"{fl_val:g}mm"
                     if ts:
                         try:
                             meta.setdefault('dt', datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S'))
@@ -956,20 +949,23 @@ def _raw_meta_as_meta(path: str) -> Dict[str, str]:
                 try:
                     thumb = raw.extract_thumb()
                     if getattr(thumb, 'format', None) == rawpy.ThumbFormat.JPEG:
-                        exif = Image.open(io.BytesIO(thumb.data)).getexif()
-                        _exif_to_meta(exif, meta)
+                        if piexif is not None:
+                            try:
+                                exif_dict = piexif.load(thumb.data)
+                                _exif_to_meta(_PieExifAdapter(exif_dict), meta)
+                            except Exception:
+                                pass
+                        if not meta.get('make') or not meta.get('model'):
+                            exif = Image.open(io.BytesIO(thumb.data)).getexif()
+                            _exif_to_meta(exif, meta)
                 except Exception:
                     pass
     except Exception:
         pass
-    ext = _exiftool_read_meta_text(path)
-    for k in ('make','model','lens','iso','fl','dt'):
-        if not meta.get(k) and ext.get(k):
-            meta[k] = ext[k]
-    if ext.get('fnumber_text'):
-        meta['fnumber_text'] = ext['fnumber_text']
-    if ext.get('exp_text'):
-        meta['exp_text'] = ext['exp_text']
+    if meta.get('fnumber') and not meta.get('fnumber_text'):
+        meta['fnumber_text'] = f"f/{meta['fnumber']}"
+    if meta.get('exp') and not meta.get('exp_text'):
+        meta['exp_text'] = meta['exp']
     return meta
 
 @dataclass
@@ -2702,14 +2698,6 @@ class CullingWidget(QWidget):
 
         if not self.catalog.photos:
             QMessageBox.information(self, "Information", "No supported photo files found.")
-        elif EXIFTOOL_PATH is None:
-            QMessageBox.warning(
-                self,
-                "XMP Features Disabled",
-                "Could not find the ExifTool command-line utility.\n"
-                "Rating and color label features are disabled.\n"
-                "Please install ExifTool from https://exiftool.org/ and ensure it is on your PATH.",
-            )
 
         self.setStyleSheet(f"""
             QWidget#card {{
@@ -4107,10 +4095,6 @@ class CullingWidget(QWidget):
                 self._update_selected_badge_fast()
             return
 
-        if EXIFTOOL_PATH is None:
-            self._update_selected_badge_fast()
-            return
-
         app = QApplication.instance()
         progress = None
         if app:
@@ -4836,7 +4820,7 @@ class AboutDialog(QDialog):
             ("Pillow", "https://python-pillow.org"),
             ("NumPy", "https://numpy.org"),
             ("psutil", "https://github.com/giampaolo/psutil"),
-            ("ExifTool", "https://exiftool.org"),
+            ("piexif", "https://pypi.org/project/piexif/"),
         ]
 
         oss_links = ", ".join(
