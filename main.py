@@ -29,6 +29,13 @@ try:
 except Exception:
     mp = None
 
+try:
+    from mediapipe.tasks import python as mp_tasks_python
+    from mediapipe.tasks.python import vision as mp_tasks_vision
+except Exception:
+    mp_tasks_python = None
+    mp_tasks_vision = None
+
 from PySide6.QtCore import (
     Qt,
     QSize,
@@ -81,6 +88,54 @@ def theme_color(path: str) -> str:
 
 def theme_qcolor(path: str) -> QColor:
     return QColor(theme_color(path))
+
+
+_FACE_LANDMARKER_MODEL_PATH: Optional[str] = None
+_FACE_LANDMARKER_CANDIDATE_NAMES = (
+    "face_landmarker_with_attention.task",
+    "face_landmarker.task",
+)
+
+
+def _find_face_landmarker_model_path() -> Optional[str]:
+    global _FACE_LANDMARKER_MODEL_PATH
+    if _FACE_LANDMARKER_MODEL_PATH is not None:
+        return _FACE_LANDMARKER_MODEL_PATH
+
+    env_override = os.environ.get("MEDIAPIPE_FACE_LANDMARKER_PATH")
+    if env_override:
+        candidate = os.path.abspath(os.path.expanduser(env_override))
+        if os.path.isfile(candidate):
+            _FACE_LANDMARKER_MODEL_PATH = candidate
+            return _FACE_LANDMARKER_MODEL_PATH
+
+    if mp is None or not hasattr(mp, "__file__"):
+        _FACE_LANDMARKER_MODEL_PATH = None
+        return None
+
+    root = Path(mp.__file__).resolve().parent
+    search_dirs = [
+        root / "modules" / "face_landmark",
+        root / "tasks" / "vision",
+        root / "tasks" / "models",
+    ]
+    for directory in search_dirs:
+        for name in _FACE_LANDMARKER_CANDIDATE_NAMES:
+            candidate = directory / name
+            if candidate.exists():
+                _FACE_LANDMARKER_MODEL_PATH = str(candidate)
+                return _FACE_LANDMARKER_MODEL_PATH
+
+    _FACE_LANDMARKER_MODEL_PATH = None
+    return None
+
+
+def _analysis_dependencies_available() -> bool:
+    if cv2 is None:
+        return False
+    if mp is None or mp_tasks_python is None or mp_tasks_vision is None:
+        return False
+    return _find_face_landmarker_model_path() is not None
 
 def _prof_enabled():
     app = QApplication.instance()
@@ -149,7 +204,7 @@ SHARPNESS_BUCKETS: List[Tuple[str, str]] = [
 ]
 SHARPNESS_BUCKET_LABELS = {key: label for key, label in SHARPNESS_BUCKETS}
 
-ANALYSIS_VERSION = 2
+ANALYSIS_VERSION = 3
 
 
 def classify_eye_bucket(open_people: int, face_people: int, valid_people: Optional[int] = None) -> Tuple[str, float]:
@@ -2126,21 +2181,31 @@ class AnalysisWorker(QObject):
         super().__init__()
         self.photos = photos
         self._cancel_requested = threading.Event()
-        self._face_mesh = self._create_face_mesh()
+        self._face_landmarker = self._create_face_landmarker()
         self._ear_threshold = 0.28
 
     @staticmethod
-    def _create_face_mesh():
+    def _create_face_landmarker():
         if mp is None:
             return None
+        if mp_tasks_python is None or mp_tasks_vision is None:
+            return None
+        model_path = _find_face_landmarker_model_path()
+        if not model_path:
+            return None
         try:
-            return mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True,
-                refine_landmarks=True,
-                max_num_faces=12,
-                min_detection_confidence=0.5,
+            base_options = mp_tasks_python.BaseOptions(model_asset_path=model_path)
+            options = mp_tasks_vision.FaceLandmarkerOptions(
+                base_options=base_options,
+                running_mode=mp_tasks_vision.RunningMode.IMAGE,
+                num_faces=12,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
             )
+            return mp_tasks_vision.FaceLandmarker.create_from_options(options)
         except Exception:
             return None
 
@@ -2169,12 +2234,12 @@ class AnalysisWorker(QObject):
             self.progress.emit(index, total, elapsed, name)
         canceled = self._cancel_requested.is_set()
         self.finished.emit(results, canceled)
-        if self._face_mesh is not None:
+        if self._face_landmarker is not None:
             try:
-                self._face_mesh.close()
+                self._face_landmarker.close()
             except Exception:
                 pass
-            self._face_mesh = None
+            self._face_landmarker = None
 
     def _process_photo(self, photo: Photo) -> Optional[Dict]:
         if cv2 is None:
@@ -2248,25 +2313,32 @@ class AnalysisWorker(QObject):
         }
 
     def _detect_eyes(self, rgb_image: np.ndarray) -> Tuple[int, int, int]:
-        if self._face_mesh is None:
-            raise RuntimeError("MediaPipe Face Mesh is not available for analysis")
+        if self._face_landmarker is None:
+            raise RuntimeError("MediaPipe Face Landmarker is not available for analysis")
 
         if rgb_image.ndim != 3 or rgb_image.shape[2] != 3:
             return 0, 0, 0
 
-        # MediaPipe expects RGB float arrays marked as not writeable.
         frame = np.ascontiguousarray(rgb_image)
-        frame.flags.writeable = False
-        results = self._face_mesh.process(frame)
-        if not results.multi_face_landmarks:
+        try:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+        except Exception:
+            return 0, 0, 0
+
+        try:
+            results = self._face_landmarker.detect(mp_image)
+        except Exception:
+            return 0, 0, 0
+
+        if not results or not getattr(results, "face_landmarks", None):
             return 0, 0, 0
 
         h, w = frame.shape[:2]
-        total_faces = len(results.multi_face_landmarks)
+        total_faces = len(results.face_landmarks)
         valid_faces = 0
         open_faces = 0
 
-        for landmarks in results.multi_face_landmarks:
+        for landmarks in results.face_landmarks:
             left_ear = self._compute_eye_aspect_ratio(landmarks, self._LEFT_EYE_IDXS, w, h)
             right_ear = self._compute_eye_aspect_ratio(landmarks, self._RIGHT_EYE_IDXS, w, h)
 
@@ -2287,7 +2359,11 @@ class AnalysisWorker(QObject):
     @staticmethod
     def _compute_eye_aspect_ratio(landmarks, indices: Tuple[int, ...], width: int, height: int) -> Optional[float]:
         try:
-            pts = [landmarks.landmark[i] for i in indices]
+            if hasattr(landmarks, "landmark"):
+                source = landmarks.landmark
+            else:
+                source = landmarks
+            pts = [source[i] for i in indices]
         except Exception:
             return None
 
@@ -2295,9 +2371,13 @@ class AnalysisWorker(QObject):
         for pt in pts:
             if pt is None:
                 return None
-            if not np.isfinite(pt.x) or not np.isfinite(pt.y):
+            x = getattr(pt, "x", None)
+            y = getattr(pt, "y", None)
+            if x is None or y is None:
                 return None
-            coords.append(np.array([pt.x * width, pt.y * height], dtype=np.float32))
+            if not np.isfinite(x) or not np.isfinite(y):
+                return None
+            coords.append(np.array([float(x) * width, float(y) * height], dtype=np.float32))
 
         if len(coords) != 6:
             return None
@@ -2449,7 +2529,7 @@ class FilterDialog(QDialog):
             for cb in self.sharp_checkboxes.values():
                 cb.setEnabled(False)
             self.analysis_notice.setText(
-                "Install opencv-python-headless and mediapipe to enable eye openness and sharpness filters."
+                "Install opencv-python-headless and mediapipe (with Face Landmarker task assets) to enable eye openness and sharpness filters."
             )
             self.process_button.setEnabled(False)
             return
@@ -2615,7 +2695,7 @@ class CullingWidget(QWidget):
         self._filter_dialog: Optional[FilterDialog] = None
         self._filter_counts: Dict[str, Dict[str, int]] = {}
         self._photo_by_path: Dict[str, Photo] = {}
-        self._analysis_supported = (cv2 is not None) and (mp is not None)
+        self._analysis_supported = _analysis_dependencies_available()
 
         self.pil_full_cache: OrderedDict[str, Image.Image] = OrderedDict()
         self.pil_half_cache: OrderedDict[str, Image.Image] = OrderedDict()
@@ -3549,7 +3629,7 @@ class CullingWidget(QWidget):
 
         if not self._analysis_supported:
             self._show_toast(
-                "Analysis requires OpenCV and MediaPipe. Install opencv-python-headless and mediapipe to enable this feature."
+                "Analysis requires OpenCV and MediaPipe Face Landmarker support. Install opencv-python-headless and mediapipe to enable this feature."
             )
             return
 
