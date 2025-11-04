@@ -10,11 +10,12 @@ from collections import OrderedDict
 from queue import PriorityQueue, Empty
 from contextlib import contextmanager
 from html import escape as _h
+import xml.etree.ElementTree as ET
 
 try:
-    import exiv2
+    import piexif
 except Exception:
-    exiv2 = None
+    piexif = None
 
 import numpy as np
 from PIL import Image, ImageQt, ImageOps
@@ -95,6 +96,23 @@ def _ptime(label: str, warn_ms: float = 16.0):
 SUPPORTED_EXTS = {
     '.cr3', '.cr2', '.nef', '.arw', '.raf', '.dng', '.orf', '.rw2', '.srw', '.pef'
 }
+
+_XMP_NS = "http://ns.adobe.com/xap/1.0/"
+_PHOTOSHOP_NS = "http://ns.adobe.com/photoshop/1.0/"
+_RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+_X_NS = "adobe:ns:meta/"
+
+for _prefix, _uri in (
+    ("x", _X_NS),
+    ("rdf", _RDF_NS),
+    ("xmp", _XMP_NS),
+    ("photoshop", _PHOTOSHOP_NS),
+):
+    try:
+        ET.register_namespace(_prefix, _uri)
+    except ValueError:
+        # Namespace may already be registered when reloading modules.
+        pass
 
 DEFAULT_HOTKEYS = OrderedDict([
     ('next', 'D, Right'),
@@ -411,9 +429,62 @@ class HotkeyDialog(QDialog):
         )
 
 
+def _try_parse_xmp(path: str) -> Optional[ET.ElementTree]:
+    try:
+        return ET.parse(path)
+    except FileNotFoundError:
+        return None
+    except ET.ParseError:
+        return None
+    except Exception as exc:
+        print(f"Warning: Unexpected error parsing XMP {os.path.basename(path)}: {exc}")
+        return None
+
+
+def _create_xmp_tree() -> Tuple[ET.ElementTree, ET.Element]:
+    root = ET.Element(f'{{{_X_NS}}}xmpmeta')
+    rdf = ET.SubElement(root, f'{{{_RDF_NS}}}RDF')
+    desc = ET.SubElement(rdf, f'{{{_RDF_NS}}}Description')
+    desc.set(f'{{{_RDF_NS}}}about', '')
+    return ET.ElementTree(root), desc
+
+
+def _ensure_xmp_description(root: ET.Element) -> ET.Element:
+    rdf = root.find(f'{{{_RDF_NS}}}RDF')
+    if rdf is None:
+        rdf = ET.SubElement(root, f'{{{_RDF_NS}}}RDF')
+    desc = rdf.find(f'{{{_RDF_NS}}}Description')
+    if desc is None:
+        desc = ET.SubElement(rdf, f'{{{_RDF_NS}}}Description')
+        desc.set(f'{{{_RDF_NS}}}about', '')
+    return desc
+
+
+def _locate_xmp_description(root: Optional[ET.Element]) -> Optional[ET.Element]:
+    if root is None:
+        return None
+    if root.tag == f'{{{_X_NS}}}xmpmeta':
+        rdf = root.find(f'{{{_RDF_NS}}}RDF')
+        if rdf is not None:
+            desc = rdf.find(f'{{{_RDF_NS}}}Description')
+            if desc is not None:
+                return desc
+    for desc in root.findall(f'.//{{{_RDF_NS}}}Description'):
+        return desc
+    return None
+
+
+def _prepare_xmp_tree_for_write(xmp_path: str) -> Tuple[ET.ElementTree, ET.Element]:
+    tree = _try_parse_xmp(xmp_path)
+    if tree is not None:
+        root = tree.getroot()
+        if root.tag == f'{{{_X_NS}}}xmpmeta':
+            return tree, _ensure_xmp_description(root)
+    return _create_xmp_tree()
+
+
 def read_xmp_sidecar(path: str) -> Dict:
     """Reads rating, label, and pick status from an XMP sidecar file."""
-    if exiv2 is None: return {}
     xmp_path = os.path.splitext(path)[0] + '.xmp'
 
     with _XMP_GLOBAL_LOCK:
@@ -421,85 +492,199 @@ def read_xmp_sidecar(path: str) -> Dict:
             if not os.path.exists(xmp_path) or os.path.getsize(xmp_path) == 0:
                 return {}
         except FileNotFoundError:
-            return {} 
+            return {}
 
-        for attempt in range(3):
+        tree = _try_parse_xmp(xmp_path)
+        if tree is None:
+            return {}
+
+        desc = _locate_xmp_description(tree.getroot())
+        if desc is None:
+            return {}
+
+        data: Dict[str, object] = {}
+        rating_val = desc.get(f'{{{_XMP_NS}}}Rating')
+        if rating_val:
             try:
-                img = exiv2.ImageFactory.open(xmp_path)
-                img.readMetadata()
-                xmp = img.xmpData()
-                
-                data = {}
-                if 'Xmp.xmp.Rating' in xmp:
-                    data['rating'] = int(xmp['Xmp.xmp.Rating'].print())
-                if 'Xmp.xmp.Label' in xmp:
-                    data['color_label'] = xmp['Xmp.xmp.Label'].print()
-                if 'Xmp.photoshop.Urgency' in xmp:
-                    urgency_val = int(xmp['Xmp.photoshop.Urgency'].print())
-                    data['selected'] = urgency_val == 1
-                return data
-            except exiv2.Exiv2Error as e:
-                if e.code == 21 and attempt < 2: 
-                    time.sleep(0.05)
-                    continue
-                print(f"Warning: Could not read XMP for {os.path.basename(path)}: {e}")
-                return {}
-            except Exception as e:
-                print(f"Warning: Unexpected error reading XMP for {os.path.basename(path)}: {e}")
-                return {}
-        return {}
+                data['rating'] = int(rating_val)
+            except ValueError:
+                pass
+
+        label_val = desc.get(f'{{{_XMP_NS}}}Label')
+        if label_val:
+            data['color_label'] = label_val
+
+        urgency_val = desc.get(f'{{{_PHOTOSHOP_NS}}}Urgency')
+        if urgency_val is not None:
+            try:
+                data['selected'] = int(urgency_val) == 1
+            except ValueError:
+                data['selected'] = urgency_val == '1'
+
+        return data
+
 
 def write_xmp_sidecar(path: str, data: Dict):
     """Writes rating, label, or pick status to an XMP sidecar file."""
-    if exiv2 is None: return False
     xmp_path = os.path.splitext(path)[0] + '.xmp'
 
     with _XMP_GLOBAL_LOCK:
         try:
-            raw_img = exiv2.ImageFactory.open(path)
-            raw_img.readMetadata()
-            
-            if os.path.exists(xmp_path):
-                try:
-                    sidecar_img = exiv2.ImageFactory.open(xmp_path)
-                    sidecar_img.readMetadata()
-                    raw_img.setXmpData(sidecar_img.xmpData())
-                except Exception:
-                    pass
-
-            xmp = raw_img.xmpData()
+            tree, desc = _prepare_xmp_tree_for_write(xmp_path)
 
             if 'rating' in data and data['rating'] is not None:
                 rating_val = int(data['rating'])
-                if rating_val == 0 and 'Xmp.xmp.Rating' in xmp:
-                     xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Rating')))
-                elif rating_val > 0:
-                    xmp['Xmp.xmp.Rating'] = str(rating_val)
-            
+                key = f'{{{_XMP_NS}}}Rating'
+                if rating_val <= 0:
+                    if key in desc.attrib:
+                        desc.attrib.pop(key, None)
+                else:
+                    desc.set(key, str(rating_val))
+
             if 'color_label' in data:
+                key = f'{{{_XMP_NS}}}Label'
                 label_val = data['color_label']
                 if label_val:
-                    xmp['Xmp.xmp.Label'] = str(label_val)
-                elif 'Xmp.xmp.Label' in xmp:
-                    xmp.erase(xmp.findKey(exiv2.XmpKey('Xmp.xmp.Label')))
+                    desc.set(key, str(label_val))
+                else:
+                    desc.attrib.pop(key, None)
 
             if 'selected' in data and data['selected'] is not None:
-                is_selected = data['selected']
-                urgency_key_str = 'Xmp.photoshop.Urgency'
-                
-                if is_selected:
-                    xmp[urgency_key_str] = '1'
-                elif urgency_key_str in xmp:
-                    xmp[urgency_key_str] = '0'
+                key = f'{{{_PHOTOSHOP_NS}}}Urgency'
+                desc.set(key, '1' if bool(data['selected']) else '0')
 
-            with open(xmp_path, 'w', encoding='utf-8') as f:
-                f.write(raw_img.xmpPacket())
+            tree.write(xmp_path, encoding='utf-8', xml_declaration=True)
+            return True
 
         except Exception as e:
             print(f"Error writing XMP for {os.path.basename(path)}: {e}")
             return False
 
     return True
+
+
+def _decode_bytes(value: bytes) -> str:
+    for encoding in ('utf-8', 'latin-1'):
+        try:
+            return value.decode(encoding).rstrip('\x00')
+        except Exception:
+            continue
+    return value.decode('utf-8', 'ignore').rstrip('\x00')
+
+
+def _rational_to_float(value) -> Optional[float]:
+    try:
+        num, den = value
+        if den:
+            return float(num) / float(den)
+    except Exception:
+        return None
+    return None
+
+
+def _rational_to_fraction(value) -> Optional[str]:
+    try:
+        num, den = value
+        if den == 0:
+            return None
+        if num == 0:
+            return '0'
+        if num >= den:
+            return f"{float(num) / float(den):g}"
+        return f"{num}/{den}"
+    except Exception:
+        return None
+
+
+def _piexif_value_to_string(value) -> str:
+    if isinstance(value, bytes):
+        return _decode_bytes(value)
+    if isinstance(value, tuple):
+        if len(value) == 2 and all(isinstance(v, (int, float)) for v in value):
+            fraction = _rational_to_fraction(value)
+            if fraction:
+                return fraction
+        if value and all(isinstance(v, tuple) and len(v) == 2 for v in value):
+            parts = []
+            for part in value:
+                fval = _rational_to_float(part)
+                if fval is not None:
+                    parts.append(f"{fval:g}")
+            if parts:
+                return ", ".join(parts)
+    return str(value)
+
+
+def _piexif_read_meta_text(path: str) -> Dict[str, str]:
+    if piexif is None:
+        return {}
+
+    try:
+        exif_dict = piexif.load(path)
+    except Exception:
+        return {}
+
+    def gp(*candidates, formatter=None) -> str:
+        for ifd_name, tag in candidates:
+            section = exif_dict.get(ifd_name)
+            if not section:
+                continue
+            value = section.get(tag)
+            if value is None:
+                continue
+            if formatter:
+                result = formatter(value)
+            else:
+                result = _piexif_value_to_string(value)
+            if result:
+                return result
+        return ""
+
+    def _format_fnumber(value) -> str:
+        fval = _rational_to_float(value)
+        return f"{fval:.1f}" if fval else ""
+
+    def _format_exposure(value) -> str:
+        fraction = _rational_to_fraction(value)
+        if fraction:
+            return fraction
+        fval = _rational_to_float(value)
+        return f"{fval:g}" if fval else ""
+
+    def _format_iso(value) -> str:
+        if isinstance(value, (tuple, list)) and value:
+            value = value[0]
+        if isinstance(value, (bytes, bytearray)):
+            return _decode_bytes(value)
+        try:
+            return str(int(value))
+        except Exception:
+            return str(value)
+
+    def _format_focal(value) -> str:
+        fval = _rational_to_float(value)
+        if fval is None:
+            return ""
+        return f"{fval:g}mm"
+
+    meta: Dict[str, str] = {}
+    meta['make'] = gp(('0th', piexif.ImageIFD.Make))
+    meta['model'] = gp(('0th', piexif.ImageIFD.Model))
+    meta['lens'] = gp(
+        ('Exif', piexif.ExifIFD.LensModel),
+        ('Exif', piexif.ExifIFD.LensMake),
+    )
+    meta['fnumber_text'] = gp(('Exif', piexif.ExifIFD.FNumber), formatter=_format_fnumber)
+    meta['exp_text'] = gp(('Exif', piexif.ExifIFD.ExposureTime), formatter=_format_exposure)
+    meta['iso'] = gp(('Exif', piexif.ExifIFD.ISOSpeedRatings), formatter=_format_iso)
+    meta['fl'] = gp(('Exif', piexif.ExifIFD.FocalLength), formatter=_format_focal)
+    meta['dt'] = gp(
+        ('Exif', piexif.ExifIFD.DateTimeOriginal),
+        ('0th', piexif.ImageIFD.DateTime),
+    )
+
+    return {k: v for k, v in meta.items() if v}
+
 
 def read_exif_datetime(path: str, st: Optional[os.stat_result] = None) -> Optional[datetime]:
     try:
@@ -699,36 +884,17 @@ def _jpeg_exif_as_meta(path: str) -> Dict[str, str]:
     _exif_to_meta(exif, meta)
     return meta
 
-def _exiv2_read_meta_text(path: str) -> Dict[str, str]:
-    if exiv2 is None:
+def _piexif_fallback_meta(path: str) -> Dict[str, str]:
+    meta = _piexif_read_meta_text(path)
+    if not meta:
         return {}
-    try:
-        img = exiv2.ImageFactory.open(path)
-        img.readMetadata()
-        exif = img.exifData()
-        xmp  = img.xmpData()
-        def gp(*keys) -> str:
-            for k in keys:
-                try:
-                    if k in exif:
-                        return exif[k].print()
-                    if k in xmp:
-                        return xmp[k].print()
-                except Exception:
-                    pass
-            return ""
-        meta: Dict[str, str] = {}
-        meta['make']   = gp("Exif.Image.Make")
-        meta['model']  = gp("Exif.Image.Model")
-        meta['lens']   = gp("Exif.Photo.LensModel", "Xmp.aux.Lens", "Xmp.exifEX.LensModel", "Xmp.aux.LensID")
-        meta['fnumber_text'] = gp("Exif.Photo.FNumber", "Exif.Photo.ApertureValue")
-        meta['exp_text']     = gp("Exif.Photo.ExposureTime", "Xmp.exif.ExposureTime")
-        meta['iso']    = gp("Exif.Photo.PhotographicSensitivity", "Exif.Photo.ISOSpeedRatings", "Xmp.exif.ISOSpeedRatings")
-        meta['fl']     = gp("Exif.Photo.FocalLength", "Xmp.exif.FocalLength")
-        meta['dt']     = gp("Exif.Photo.DateTimeOriginal", "Exif.Image.DateTime", "Xmp.exif.DateTimeOriginal", "Xmp.xmp.CreateDate")
-        return {k: v for k, v in meta.items() if v}
-    except Exception:
-        return {}
+    # Normalize keys to align with UI expectations.
+    if 'fnumber' not in meta and 'fnumber_text' in meta:
+        try:
+            meta['fnumber'] = f"{float(meta['fnumber_text']):.1f}"
+        except Exception:
+            pass
+    return meta
 
 def _raw_meta_as_meta(path: str) -> Dict[str, str]:
     meta: Dict[str, str] = {}
@@ -766,7 +932,7 @@ def _raw_meta_as_meta(path: str) -> Dict[str, str]:
                     pass
     except Exception:
         pass
-    ext = _exiv2_read_meta_text(path)
+    ext = _piexif_fallback_meta(path)
     for k in ('make','model','lens','iso','fl','dt'):
         if not meta.get(k) and ext.get(k):
             meta[k] = ext[k]
@@ -1951,12 +2117,6 @@ class CullingWidget(QWidget):
 
         if not self.catalog.photos:
             QMessageBox.information(self, "Information", "No supported photo files found.")
-        elif exiv2 is None:
-            QMessageBox.warning(self, "XMP Features Disabled",
-                                "Could not find the py3exiv2 library.\n"
-                                "Rating and color label features are disabled.\n"
-                                "Please run `pip install py3exiv2` to install it.")
-
         self.setStyleSheet(f"""
             QWidget#card {{
                 background:{theme_color('bg.surface')};
@@ -3079,10 +3239,6 @@ class CullingWidget(QWidget):
                 self._update_selected_badge_fast()
             return
 
-        if exiv2 is None:
-            self._update_selected_badge_fast()
-            return
-
         app = QApplication.instance()
         progress = None
         if app:
@@ -3811,7 +3967,7 @@ class AboutDialog(QDialog):
             ("Pillow", "https://python-pillow.org"),
             ("NumPy", "https://numpy.org"),
             ("psutil", "https://github.com/giampaolo/psutil"),
-            ("libexiv2 (via python-exiv2)", "https://github.com/LeoHsiao1/python-exiv2"),
+            ("piexif", "https://github.com/hMatoba/Piexif"),
         ]
 
         oss_links = ", ".join(
