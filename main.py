@@ -3872,21 +3872,32 @@ class AboutDialog(QDialog):
 
         title = QLabel(self)
         title.setAlignment(Qt.AlignCenter)
-        title_font = QFont(font_family, 18)
+        title_font = QFont(font_family, 25)
         title_font.setBold(True)
         title.setFont(title_font)
         title.setText(
             f"simple <span style=\"color:{theme_color('accent.primary')}\">raw</span> picker"
         )
         title.setTextFormat(Qt.RichText)
-        layout.addWidget(title)
 
         tagline = QLabel("fast, simple, free, RAW.", self)
         tagline.setAlignment(Qt.AlignCenter)
-        tagline_font = QFont(font_family, 11)
+        tagline_font = QFont(font_family, 12)
         tagline.setFont(tagline_font)
         tagline.setStyleSheet(f"color:{theme_color('text.secondary')};")
-        layout.addWidget(tagline)
+
+        version_label = QLabel(f"Version {CURRENT_VERSION}", self)
+        version_label.setAlignment(Qt.AlignCenter)
+        version_label.setStyleSheet(f"color:{theme_color('text.tertiary')}; font-size:9pt;")
+
+        header = QWidget(self)
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(6)
+        header_layout.addWidget(title)
+        header_layout.addWidget(tagline)
+        header_layout.addWidget(version_label)
+        layout.addWidget(header)
 
         highlight_card = QFrame(self)
         highlight_card.setObjectName("HighlightCard")
