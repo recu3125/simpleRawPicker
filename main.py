@@ -303,8 +303,8 @@ class HotkeyDialog(QDialog):
 
         self.setStyleSheet(f"""
             QDialog#HotkeyDialog {{
-                background-color: {theme_color('bg.elevated')};
-                border: 1px solid {theme_color('border.default')};
+                background-color: {theme_color('bg.base')};
+                border: none
             }}
             QLabel#DialogTitle {{
                 font-size: 18pt;
@@ -361,7 +361,7 @@ class HotkeyDialog(QDialog):
                 color: {theme_color('accent.primary')};
             }}
             QLabel#ShortcutDescription {{
-                color: {theme_color('text.primary')};
+                color: {theme_color('text.secondary')};
                 font-size: 10.5pt;
             }}
             QLabel#ShortcutKey {{
