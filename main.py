@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os, sys, io, json, time, shutil, argparse, traceback
+import urllib.request
+import urllib.error
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, List, Dict, Optional, Tuple, Set
@@ -36,6 +38,8 @@ from PySide6.QtCore import (
     QStandardPaths,
     QThread,
     QMetaObject,
+    QUrl,
+    Q_ARG,
 )
 from PySide6.QtGui import (
     QPixmap,
@@ -52,6 +56,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QBrush,
     QShortcut,
+    QDesktopServices,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QMessageBox, QFrame,
@@ -65,6 +70,10 @@ try:
     import psutil
 except Exception:
     psutil = None
+
+
+CURRENT_VERSION = "1.0.0"
+MANIFEST_URL = "https://recu3125.com/simplerawpicker/manifest.json"
 
 
 def theme_color(path: str) -> str:
@@ -4287,6 +4296,7 @@ class AppWindow(QMainWindow):
         self._cleanup_thread: Optional[QThread] = None
         self._cleanup_worker: Optional[_ExportCleanupWorker] = None
         self._pending_culling_teardown: Optional[CullingWidget] = None
+        self._pending_update_notice: Optional[Tuple[str, str, str]] = None
 
         self.app_data_path = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
         os.makedirs(self.app_data_path, exist_ok=True)
@@ -4314,6 +4324,75 @@ class AppWindow(QMainWindow):
         self.update_toolbar_state(is_culling=False)
         self._refresh_help_shortcuts()
         QTimer.singleShot(200, self._show_help_if_first_time)
+
+    @Slot(str, str, str)
+    def show_update_notice(
+        self,
+        title: str,
+        body: str,
+        links_json: str,
+    ) -> None:
+        links_json = links_json or "[]"
+
+        try:
+            raw_links = json.loads(links_json)
+        except (TypeError, json.JSONDecodeError):
+            raw_links = []
+
+        links: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        if isinstance(raw_links, list):
+            for entry in raw_links:
+                text: Optional[str] = None
+                url: Optional[str] = None
+                if isinstance(entry, dict):
+                    maybe_text = entry.get("text")
+                    maybe_url = entry.get("url")
+                    text = maybe_text if isinstance(maybe_text, str) else None
+                    url = maybe_url if isinstance(maybe_url, str) else None
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    maybe_text, maybe_url = entry[0], entry[1]
+                    text = maybe_text if isinstance(maybe_text, str) else None
+                    url = maybe_url if isinstance(maybe_url, str) else None
+
+                if not text or not url:
+                    continue
+
+                normalized = (text.strip(), url.strip())
+                if not normalized[0] or not normalized[1]:
+                    continue
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                links.append(normalized)
+
+        try:
+            if not self.isVisible():
+                self._pending_update_notice = (
+                    title,
+                    body,
+                    json.dumps(links, ensure_ascii=False),
+                )
+                QTimer.singleShot(150, self._maybe_show_pending_update_notice)
+                return
+        except RuntimeError:
+            return
+
+        self._pending_update_notice = None
+        dialog = UpdateNoticeDialog(title, body, links, self)
+        dialog.exec()
+
+    def _maybe_show_pending_update_notice(self) -> None:
+        if not self._pending_update_notice:
+            return
+
+        payload = self._pending_update_notice
+        self._pending_update_notice = None
+        if payload is None:
+            return
+
+        title, body, links_json = payload
+        self.show_update_notice(title, body, links_json)
 
     def _load_app_state(self):
         try:
@@ -4774,6 +4853,171 @@ class AppWindow(QMainWindow):
             self.culling_widget.cleanup()
         event.accept()
 
+
+def _parse_version_tuple(version_str: str) -> Tuple[int, ...]:
+    parts = []
+    for part in version_str.split('.'):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            raise ValueError(f"Invalid version component: {part}")
+        parts.append(int(part))
+    return tuple(parts)
+
+
+class UpdateNoticeDialog(QDialog):
+    def __init__(
+        self,
+        title: str,
+        body: str,
+        links: Optional[List[Tuple[str, str]]],
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.setMinimumWidth(460)
+        self.setWindowTitle(title or "Update Available")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        heading_text = title or "Update Available"
+        title_label = QLabel(heading_text, self)
+        title_font = title_label.font()
+        base_point = title_font.pointSize()
+        if base_point > 0:
+            title_font.setPointSize(int(max(base_point + 4, base_point * 1.4)))
+        else:
+            base_pixel = title_font.pixelSize()
+            if base_pixel > 0:
+                title_font.setPixelSize(int(max(base_pixel + 6, base_pixel * 1.4)))
+            else:
+                title_font.setPointSize(16)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        title_label.setWordWrap(True)
+        layout.addWidget(title_label)
+
+        body_label = QLabel(body or "", self)
+        body_label.setWordWrap(True)
+        layout.addWidget(body_label)
+
+        normalized_links: List[Tuple[str, str]] = []
+        seen_links: Set[Tuple[str, str]] = set()
+        for link in links or []:
+            if not isinstance(link, (list, tuple)) or len(link) < 2:
+                continue
+            text, url = link[0], link[1]
+            if not isinstance(text, str) or not isinstance(url, str):
+                continue
+            text = text.strip()
+            url = url.strip()
+            if not text or not url:
+                continue
+            key = (text, url)
+            if key in seen_links:
+                continue
+            seen_links.add(key)
+            normalized_links.append(key)
+
+        if normalized_links:
+            links_container = QWidget(self)
+            links_layout = QVBoxLayout(links_container)
+            links_layout.setContentsMargins(0, 4, 0, 0)
+            links_layout.setSpacing(4)
+
+            for text, url in normalized_links:
+                link_label = QLabel(
+                    f'<a href="{_h(url)}">{_h(text)}</a>',
+                    links_container,
+                )
+                link_label.setTextFormat(Qt.RichText)
+                link_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+                link_label.setOpenExternalLinks(False)
+                link_label.setCursor(Qt.PointingHandCursor)
+                link_label.setWordWrap(True)
+
+                link_label.linkActivated.connect(
+                    lambda _=None, u=url: QDesktopServices.openUrl(QUrl(u))
+                )
+                links_layout.addWidget(link_label)
+
+            layout.addWidget(links_container)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok, Qt.Horizontal, self)
+        button_box.accepted.connect(self.accept)
+        layout.addWidget(button_box)
+
+
+def _check_for_updates(parent: QWidget):
+    def _worker():
+        try:
+            with urllib.request.urlopen(MANIFEST_URL, timeout=10) as response:
+                payload = response.read()
+        except Exception:
+            return
+
+        try:
+            manifest = json.loads(payload.decode('utf-8'))
+        except Exception:
+            return
+
+        latest = manifest.get('latestVersion')
+        if not latest:
+            return
+
+        try:
+            latest_tuple = _parse_version_tuple(latest)
+            current_tuple = _parse_version_tuple(CURRENT_VERSION)
+        except ValueError:
+            return
+
+        if latest_tuple <= current_tuple:
+            return
+
+        notice = manifest.get('notice') or {}
+        title = notice.get('title') or "Update Available"
+        body = notice.get('body') or ""
+
+        links: List[Dict[str, str]] = []
+        seen_links: Set[Tuple[str, str]] = set()
+
+        def _append_link(text: object, url: object) -> None:
+            if not isinstance(text, str) or not isinstance(url, str):
+                return
+            text_value = text.strip()
+            url_value = url.strip()
+            if not text_value or not url_value:
+                return
+            key = (text_value, url_value)
+            if key in seen_links:
+                return
+            seen_links.add(key)
+            links.append({"text": text_value, "url": url_value})
+
+        notice_links = notice.get('links')
+        if isinstance(notice_links, list):
+            for entry in notice_links:
+                if isinstance(entry, dict):
+                    _append_link(entry.get('text'), entry.get('url'))
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    _append_link(entry[0], entry[1])
+
+        links_json = json.dumps(links, ensure_ascii=False)
+
+        if isinstance(parent, QObject) and hasattr(parent, "show_update_notice"):
+            QMetaObject.invokeMethod(
+                parent,
+                "show_update_notice",
+                Qt.QueuedConnection,
+                Q_ARG(str, title),
+                Q_ARG(str, body),
+                Q_ARG(str, links_json),
+            )
+
+    threading.Thread(target=_worker, daemon=True).start()
+
 def main():
     parser = argparse.ArgumentParser(description='simple raw picker - A fast photo culling tool.')
     parser.add_argument('root', nargs='?', help='Path to the photo folder (optional)')
@@ -4905,6 +5149,8 @@ def main():
 
     win = AppWindow(args)
     win.show()
+
+    QTimer.singleShot(0, lambda: _check_for_updates(win))
 
     if args.root:
         win.select_folder_from_arg(args.root)
