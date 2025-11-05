@@ -3914,7 +3914,7 @@ class AboutDialog(QDialog):
         highlight_layout.addWidget(email_label)
         
         support = QLabel(
-            '<a href="http://donate.recu3125.com">Support the developer</a>',
+            '<a href="https://recu3125.com/simplerawpicker/donate">Support the developer</a>',
             highlight_card,
         )
         support.setAlignment(Qt.AlignLeft)
@@ -3927,7 +3927,7 @@ class AboutDialog(QDialog):
 
 
         feedback_label = QLabel(
-            '<a href="https://forms.gle/QopoQ8KCXJoYZHT39">Bug reports & feedback form</a>',
+            '<a href="https://recu3125.com/simplerawpicker/feedback">Bug reports & feedback form</a>',
             highlight_card,
         )
         feedback_label.setTextFormat(Qt.RichText)
@@ -4124,7 +4124,7 @@ class WelcomeWidget(QWidget):
         self.recent_layout = QVBoxLayout(self.recent_container); self.recent_layout.setContentsMargins(0, 0, 0, 0); self.recent_layout.setSpacing(6)
         bl.addWidget(self.recent_container, 0, Qt.AlignTop)
 
-        support = QLabel('<a href="http://donate.recu3125.com">Support the developer</a>', self.bottom_section)
+        support = QLabel('<a href="https://recu3125.com/simplerawpicker/donate">Support the developer</a>', self.bottom_section)
         support.setOpenExternalLinks(True); support.setAlignment(Qt.AlignCenter)
         support.setStyleSheet(
             f"QLabel {{ color:{accent_primary}; font-size:10pt; margin-top:{self.FOOTER_MARGIN_TOP}px; }}"
