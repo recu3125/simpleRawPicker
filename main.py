@@ -3879,7 +3879,7 @@ class AboutDialog(QDialog):
         title_font.setBold(True)
         title.setFont(title_font)
         title.setText(
-            f"simple <span style=\"color:{theme_color('accent.primary')}\">raw</span> picker"
+            f"simple <span style=\"color:{theme_color('accent.super')}\">raw</span> picker"
         )
         title.setTextFormat(Qt.RichText)
 
@@ -4057,6 +4057,7 @@ class WelcomeWidget(QWidget):
         self.on_select_folder = on_select_folder
 
         accent_primary = theme_color('accent.primary')
+        accent_super = theme_color('accent.super')
         accent_hover = theme_color('accent.hover')
         accent_active = theme_color('accent.active')
         text_on_accent = theme_color('text.on_accent')
@@ -4080,13 +4081,40 @@ class WelcomeWidget(QWidget):
         app = QApplication.instance()
         font_family = getattr(app, "_custom_font_family", "Arial")
 
-        self.title = QLabel(self.center_group)
-        self.title.setText(
-            f"simple <span style=\"color:{accent_primary}\">raw</span> picker"
-        )
-        self.title.setTextFormat(Qt.RichText); self.title.setAlignment(Qt.AlignCenter)
-        tf = QFont(font_family, 40); tf.setBold(True); self.title.setFont(tf)
-        cg.addWidget(self.title, 0, Qt.AlignHCenter)
+        tf = QFont(font_family, 40); tf.setBold(True)
+
+        self.title_row = QWidget(self.center_group)
+        title_layout = QHBoxLayout(self.title_row)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(12)
+        title_layout.setAlignment(Qt.AlignCenter)
+
+        def _make_title_label(text: str, color: str) -> QLabel:
+            lbl = QLabel(text, self.title_row)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setFont(tf)
+            lbl.setStyleSheet(f"color:{color};")
+            return lbl
+
+        text_primary = theme_color('text.primary')
+
+        self.title_simple = _make_title_label("simple", text_primary)
+        self.title_raw = _make_title_label("raw", accent_super)
+        self.title_picker = _make_title_label("picker", text_primary)
+
+        raw_glow = QGraphicsDropShadowEffect(self.title_raw)
+        raw_glow.setBlurRadius(36)
+        raw_glow.setOffset(0, 0)
+        raw_glow_color = theme_qcolor('accent.primary')
+        raw_glow_color.setAlpha(100)
+        raw_glow.setColor(raw_glow_color)
+        self.title_raw.setGraphicsEffect(raw_glow)
+
+        title_layout.addWidget(self.title_simple)
+        title_layout.addWidget(self.title_raw)
+        title_layout.addWidget(self.title_picker)
+
+        cg.addWidget(self.title_row, 0, Qt.AlignHCenter)
 
         cg.addSpacing(self.GAP_TITLE_BTN)
 
@@ -4105,13 +4133,14 @@ class WelcomeWidget(QWidget):
                 font-weight: bold;
                 padding: 12px 18px;
                 border-radius: 10px;
+                margin-bottom: 20px;
             }}
             QPushButton#WelcomeButton:hover {{ background-color: {accent_hover}; }}
             QPushButton#WelcomeButton:pressed {{ background-color: {accent_active}; }}
         """)
-        shadow = QGraphicsDropShadowEffect(self); shadow.setBlurRadius(24); shadow.setOffset(0, 4)
-        shadow_color = theme_qcolor('accent.primary')
-        shadow_color.setAlpha(110)
+        shadow = QGraphicsDropShadowEffect(self); shadow.setBlurRadius(36); shadow.setOffset(0, 0)
+        shadow_color = theme_qcolor('accent.super')
+        shadow_color.setAlpha(30)
         shadow.setColor(shadow_color)
         self.select_btn.setGraphicsEffect(shadow)
         cg.addWidget(self.select_btn, 0, Qt.AlignHCenter)
@@ -4148,7 +4177,7 @@ class WelcomeWidget(QWidget):
         self.recent_layout = QVBoxLayout(self.recent_container); self.recent_layout.setContentsMargins(0, 0, 0, 0); self.recent_layout.setSpacing(6)
         bl.addWidget(self.recent_container, 0, Qt.AlignTop)
 
-        support = QLabel('<a href="https://recu3125.com/simplerawpicker/donate">Support the developer</a>', self.bottom_section)
+        support = QLabel('<a href="https://recu3125.com/simplerawpicker/donate">Support the developer♡</a>', self.bottom_section)
         support.setOpenExternalLinks(True); support.setAlignment(Qt.AlignCenter)
         support.setStyleSheet(
             f"QLabel {{ color:{accent_primary}; font-size:10pt; margin-top:{self.FOOTER_MARGIN_TOP}px; }}"
