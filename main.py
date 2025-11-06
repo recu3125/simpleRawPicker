@@ -3988,6 +3988,7 @@ class AboutDialog(QDialog):
             ("NumPy", "https://numpy.org"),
             ("psutil", "https://github.com/giampaolo/psutil"),
             ("piexif", "https://github.com/hMatoba/Piexif"),
+            ("Gantari typeface","https://github.com/google/fonts/tree/main/ofl/gantari"),
         ]
 
         oss_links = ", ".join(
