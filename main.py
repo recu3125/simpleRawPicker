@@ -933,10 +933,13 @@ def _raw_meta_as_meta(path: str) -> Dict[str, str]:
                         except Exception:
                             pass
                 try:
-                    thumb = raw.extract_thumb()
-                    if getattr(thumb, 'format', None) == rawpy.ThumbFormat.JPEG:
-                        exif = Image.open(io.BytesIO(thumb.data)).getexif()
-                        _exif_to_meta(exif, meta)
+                    needed_fields = ('make', 'model', 'lens', 'fnumber', 'exp', 'iso', 'fl', 'dt')
+                    needs_thumb_exif = any(not meta.get(k) for k in needed_fields)
+                    if needs_thumb_exif:
+                        thumb = raw.extract_thumb()
+                        if getattr(thumb, 'format', None) == rawpy.ThumbFormat.JPEG:
+                            exif = Image.open(io.BytesIO(thumb.data)).getexif()
+                            _exif_to_meta(exif, meta)
                 except Exception:
                     pass
     except Exception:
