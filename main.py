@@ -3305,6 +3305,16 @@ class CullingWidget(QWidget):
 
     def save_all_dirty_files(self, wait: bool = False):
         """Save all in-memory changes (selections.json and XMP) to disk."""
+        if QThread.currentThread() != self.thread():
+            connection_type = Qt.BlockingQueuedConnection if wait else Qt.QueuedConnection
+            QMetaObject.invokeMethod(
+                self,
+                "save_all_dirty_files",
+                connection_type,
+                Q_ARG(bool, wait),
+            )
+            return
+
         self.autosave_timer.stop()
 
         selected_paths = [p.path for p in self.catalog.photos if p.selected]
@@ -3401,12 +3411,8 @@ class CullingWidget(QWidget):
         except Exception:
             pass
 
-    def cleanup(self):
-        if QThread.currentThread() != self.thread():
-            QMetaObject.invokeMethod(self, "_cleanup_qt_objects", Qt.BlockingQueuedConnection)
-        else:
-            self._cleanup_qt_objects()
-
+    @Slot()
+    def _finish_cleanup_on_gui(self):
         self.save_all_dirty_files()
         self._flush_queue()
 
@@ -3421,6 +3427,15 @@ class CullingWidget(QWidget):
                 t.join(timeout=0.5)
         except Exception:
             pass
+
+    def cleanup(self):
+        if QThread.currentThread() == self.thread():
+            self._cleanup_qt_objects()
+            self._finish_cleanup_on_gui()
+            return
+
+        QMetaObject.invokeMethod(self, "_cleanup_qt_objects", Qt.BlockingQueuedConnection)
+        QMetaObject.invokeMethod(self, "_finish_cleanup_on_gui", Qt.BlockingQueuedConnection)
 
               
 class KeySequenceEdit(QLineEdit):
