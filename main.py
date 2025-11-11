@@ -106,6 +106,152 @@ SUPPORTED_EXTS = {
     '.cr3', '.cr2', '.nef', '.arw', '.raf', '.dng', '.orf', '.rw2', '.srw', '.pef'
 }
 
+
+def _list_paths_by_basename(folder: str, exts: Set[str]) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    try:
+        for fn in os.listdir(folder):
+            p = os.path.join(folder, fn)
+            if not os.path.isfile(p):
+                continue
+            base, ext = os.path.splitext(fn)
+            if ext.lower() in exts:
+                out.setdefault(base, []).append(p)
+    except Exception:
+        pass
+    return out
+
+
+def _gather_source_presence(
+    root: str, exts: Set[str], *, exclude_dirs: Optional[Set[str]] = None
+) -> Set[Tuple[str, str]]:
+    presence: Set[Tuple[str, str]] = set()
+    exclude_abs = {os.path.abspath(d) for d in (exclude_dirs or set())}
+    for dirpath, dirnames, filenames in os.walk(root):
+        abs_dirpath = os.path.abspath(dirpath)
+        if exclude_abs:
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if os.path.abspath(os.path.join(dirpath, d)) not in exclude_abs
+            ]
+        if abs_dirpath in exclude_abs:
+            continue
+        for fn in filenames:
+            base, ext = os.path.splitext(fn)
+            ext_lower = ext.lower()
+            if ext_lower in exts:
+                presence.add((base.lower(), ext_lower))
+    return presence
+
+
+def detect_orphan_sync_deletions(
+    root: str,
+    selected_raw_paths: List[str],
+    raw_output_folder_name: str,
+    jpeg_output_folder_name: str,
+) -> List[str]:
+    selected_paths = [p for p in selected_raw_paths if os.path.isfile(p)]
+    raw_out_dir = os.path.join(root, raw_output_folder_name)
+    jpeg_out_dir = os.path.join(root, jpeg_output_folder_name)
+
+    selected_raw_by_base = {
+        os.path.splitext(os.path.basename(p))[0]: p for p in selected_paths
+    }
+    root_jpegs_by_base = _list_paths_by_basename(root, {".jpg", ".jpeg"})
+
+    dest_raw_by_base = _list_paths_by_basename(
+        raw_out_dir, SUPPORTED_EXTS.union({".xmp"})
+    )
+    dest_jpg_by_base = _list_paths_by_basename(
+        jpeg_out_dir, {".jpg", ".jpeg"}
+    )
+
+    desired_jpg_bases = {
+        base for base in selected_raw_by_base if base in root_jpegs_by_base
+    }
+
+    exclude_dirs = {raw_out_dir, jpeg_out_dir}
+    raw_presence = _gather_source_presence(
+        root, SUPPORTED_EXTS.union({".xmp"}), exclude_dirs=exclude_dirs
+    )
+    jpeg_presence = _gather_source_presence(
+        root, {".jpg", ".jpeg"}, exclude_dirs=exclude_dirs
+    )
+
+    orphan_paths: List[str] = []
+
+    for base, dst_paths in dest_raw_by_base.items():
+        if base not in selected_raw_by_base:
+            for dst_path in dst_paths:
+                _, ext = os.path.splitext(dst_path)
+                key = (base.lower(), ext.lower())
+                if key not in raw_presence:
+                    orphan_paths.append(dst_path)
+
+    for base, dst_paths in dest_jpg_by_base.items():
+        if base not in desired_jpg_bases:
+            for dst_path in dst_paths:
+                _, ext = os.path.splitext(dst_path)
+                key = (base.lower(), ext.lower())
+                if key not in jpeg_presence:
+                    orphan_paths.append(dst_path)
+
+    return sorted(orphan_paths)
+
+
+def relocate_paths_to_temp_subfolders(
+    paths: List[str],
+    raw_output_dir: str,
+    jpeg_output_dir: str,
+) -> List[str]:
+    def _unique_path(target_dir: str, filename: str) -> str:
+        base, ext = os.path.splitext(filename)
+        candidate = Path(target_dir) / filename
+        if not candidate.exists():
+            return str(candidate)
+        counter = 1
+        while True:
+            candidate = Path(target_dir) / f"{base} ({counter}){ext}"
+            if not candidate.exists():
+                return str(candidate)
+            counter += 1
+
+    moved: List[str] = []
+    errors: List[Tuple[str, str]] = []
+
+    raw_abs = os.path.abspath(raw_output_dir)
+    jpeg_abs = os.path.abspath(jpeg_output_dir)
+
+    for src in paths:
+        abs_src = os.path.abspath(src)
+        if not os.path.exists(abs_src):
+            continue
+
+        try:
+            if os.path.commonpath([abs_src, raw_abs]) == raw_abs:
+                temp_dir = os.path.join(raw_abs, "temp")
+            elif os.path.commonpath([abs_src, jpeg_abs]) == jpeg_abs:
+                temp_dir = os.path.join(jpeg_abs, "temp")
+            else:
+                raise ValueError("Path is outside the export folders")
+
+            os.makedirs(temp_dir, exist_ok=True)
+            dest_path = _unique_path(temp_dir, os.path.basename(abs_src))
+            shutil.move(abs_src, dest_path)
+            moved.append(dest_path)
+        except Exception as exc:
+            errors.append((src, str(exc)))
+
+    if errors:
+        details = "\n".join(f"{p}: {err}" for p, err in errors)
+        raise RuntimeError(
+            "Failed to move leftover export files to the temp folder:\n" + details
+        )
+
+    return moved
+
+
 _XMP_NS = "http://ns.adobe.com/xap/1.0/"
 _PHOTOSHOP_NS = "http://ns.adobe.com/photoshop/1.0/"
 _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -1880,20 +2026,6 @@ class ExportWorker(QObject):
                 return True
             except Exception:
                 return True
-
-        def _list_paths_by_basename(folder: str, exts: set) -> Dict[str, List[str]]:
-            out: Dict[str, List[str]] = {}
-            try:
-                for fn in os.listdir(folder):
-                    p = os.path.join(folder, fn)
-                    if not os.path.isfile(p):
-                        continue
-                    base, ext = os.path.splitext(fn)
-                    if ext.lower() in exts:
-                        out.setdefault(base, []).append(p)
-            except Exception:
-                pass
-            return out
 
         selected_paths = [p for p in self.selected_raw_paths if os.path.isfile(p)]
         selected_count = len(selected_paths)
@@ -4632,6 +4764,76 @@ class AppWindow(QMainWindow):
         cw.save_all_dirty_files(wait=True)
 
         selected_raw_paths = [p.path for p in cw.catalog.photos if p.selected]
+
+        orphan_deletions = detect_orphan_sync_deletions(
+            cw.catalog.root,
+            selected_raw_paths,
+            self.settings.raw_output_folder_name,
+            self.settings.jpeg_output_folder_name,
+        )
+
+        if orphan_deletions:
+            def _pretty_name(path: str) -> str:
+                try:
+                    return os.path.relpath(path, cw.catalog.root)
+                except Exception:
+                    return os.path.basename(path)
+
+            max_preview = 10
+            preview_lines = [f"• {_pretty_name(p)}" for p in orphan_deletions[:max_preview]]
+            remaining = len(orphan_deletions) - max_preview
+            if remaining > 0:
+                preview_lines.append(f"… and {remaining} more")
+
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Warning)
+            msg_box.setWindowTitle("Resolve leftover exports")
+            msg_box.setText(
+                "Some exported files are no longer selected, and matching originals were not found in the working folder. "
+                "Before they are removed from the export folders, choose how you want to handle them."
+            )
+            msg_box.setInformativeText(
+                "Review the list below and choose an action before continuing with the export:\n\n"
+                + "\n".join(preview_lines)
+            )
+            msg_box.setStandardButtons(QMessageBox.NoButton)
+            move_btn = msg_box.addButton("Move to temp and continue", QMessageBox.AcceptRole)
+            delete_btn = msg_box.addButton("Delete and continue", QMessageBox.DestructiveRole)
+            cancel_btn = msg_box.addButton(QMessageBox.Cancel)
+            msg_box.setDefaultButton(move_btn)
+            msg_box.setEscapeButton(cancel_btn)
+            msg_box.exec()
+
+            clicked = msg_box.clickedButton()
+            if clicked is cancel_btn or clicked is None:
+                return False
+
+            if clicked is move_btn:
+                try:
+                    relocate_paths_to_temp_subfolders(
+                        orphan_deletions,
+                        os.path.join(cw.catalog.root, self.settings.raw_output_folder_name),
+                        os.path.join(cw.catalog.root, self.settings.jpeg_output_folder_name),
+                    )
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self,
+                        "Move failed",
+                        "Could not move leftover export files to the temp folder:\n\n" + str(exc),
+                    )
+                    return False
+                else:
+                    self.status.showMessage(
+                        f"Moved {len(orphan_deletions)} leftover file(s) to temp.",
+                        4000,
+                    )
+            elif clicked is delete_btn:
+                self.status.showMessage(
+                    "Deleting leftover exports from the sync folders.",
+                    4000,
+                )
+            else:
+                return False
 
         worker = ExportWorker(
             root=cw.catalog.root,
