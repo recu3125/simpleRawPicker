@@ -2178,6 +2178,7 @@ class CullingWidget(QWidget):
         root_box.addWidget(card, 1)
 
         self.catalog = Catalog(root)
+        self._selected_count = sum(1 for p in self.catalog.photos if p.selected)
         self.idx = 0
         self.selected_view_only = False
 
@@ -2548,9 +2549,19 @@ class CullingWidget(QWidget):
             f"cleared_pending={cleared_pending}"
         )
         
+    def _recalculate_selected_count(self):
+        self._selected_count = sum(1 for x in self.catalog.photos if x.selected)
+
+    def _apply_selection_change(self, previous: bool, current: bool):
+        prev = bool(previous)
+        cur = bool(current)
+        if prev == cur:
+            return
+        self._selected_count += 1 if cur else -1
+        self._selected_count = max(0, min(self._selected_count, len(self.catalog.photos)))
+
     def _update_selected_badge_fast(self):
-        total_sel = sum(1 for x in self.catalog.photos if x.selected)
-        self.badge_selected.setText(f"Selected: {total_sel}")
+        self.badge_selected.setText(f"Selected: {self._selected_count}")
         self.badge_selected.repaint()
 
     def _loader_loop(self):
@@ -2886,7 +2897,9 @@ class CullingWidget(QWidget):
 
         self._load_xmp_if_needed(p)
         current_index = self.idx
+        previous_selected = p.selected
         p.update_xmp({'selected': not p.selected})
+        self._apply_selection_change(previous_selected, p.selected)
 
         self._update_selected_badge_fast()
         self._update_view_after_selection_change(current_index)
@@ -2899,7 +2912,9 @@ class CullingWidget(QWidget):
         if p.selected:
             self._load_xmp_if_needed(p)
             current_index = self.idx
+            previous_selected = p.selected
             p.update_xmp({'selected': False})
+            self._apply_selection_change(previous_selected, p.selected)
 
             self._update_selected_badge_fast()
             self._update_view_after_selection_change(current_index)
@@ -3075,7 +3090,8 @@ class CullingWidget(QWidget):
 
             rating_changed = rating_val is not None and photo.rating != rating_val
             label_changed = label_val is not None and photo.color_label != label_val
-            selected_changed = selected_val is not None and photo.selected != selected_val
+            previous_selected = photo.selected
+            selected_changed = selected_val is not None and previous_selected != selected_val
 
             if rating_changed:
                 photo.rating = rating_val
@@ -3090,6 +3106,8 @@ class CullingWidget(QWidget):
             current_selected = photo.selected
 
         photo_index = self.catalog.photos.index(photo)
+        if selected_changed:
+            self._apply_selection_change(previous_selected, current_selected)
         self._update_view_after_selection_change(photo_index)
 
         cur = self._current()
@@ -3110,7 +3128,7 @@ class CullingWidget(QWidget):
         total = len(indices) if indices else len(self.catalog.photos)
         pos = self._current_position(indices)
         current_num = (pos + 1) if pos >= 0 else (self.idx + 1)
-        total_sel = sum(1 for x in self.catalog.photos if x.selected)
+        total_sel = self._selected_count
         self.badge_selected.setText(f"Selected: {total_sel}")
         view_scope = "sel" if self.selected_view_only else "all"
         msg = f"[{current_num}/{total} {view_scope}]  Selected: {total_sel}  {os.path.basename(p.path)}  |  workers: {self._num_workers}"
@@ -3380,6 +3398,7 @@ class CullingWidget(QWidget):
             except Exception:
                 pass
             finally:
+                self._recalculate_selected_count()
                 self._update_selected_badge_fast()
             return
 
@@ -3422,6 +3441,7 @@ class CullingWidget(QWidget):
         if progress:
             progress.close()
 
+        self._selected_count = len(selected_paths)
         self._update_selected_badge_fast()
 
         data = {
