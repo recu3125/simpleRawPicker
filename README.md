@@ -1,4 +1,6 @@
 <div align="center">
+  
+<img height="150" alt="icon_crop" src="https://github.com/user-attachments/assets/411c3a29-7f62-4cd6-becc-90209ad80153" />
 
 <h1>Simple Raw Picker</h1>
 
@@ -22,7 +24,7 @@ Zebra + Histogram and Faux HDR help check exposure and detail. Ratings and color
 
 
 ## Download
-[simple-raw-picker-setup](https://github.com/recu3125/simpleRawPicker/releases/download/v1.0/simple-raw-picker-setup.zip)
+[simple-raw-picker-setup (windows)](https://github.com/recu3125/simpleRawPicker/releases/download/v1.0/simple-raw-picker-setup.zip)
 
 ## Quick Start
 
