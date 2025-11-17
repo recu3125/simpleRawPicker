@@ -1,15 +1,28 @@
 <div align="center">
 
-# Simple Raw Picker  
-<em>fast · simple · free</em>
-<br><br><br>
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K61KXALF)
+<h1>Simple Raw Picker</h1>
+
+<p>
+  Simple Raw Picker is a fast, simple, free culling app for RAW files.<br>
+</p>
+<br>
+<p>
+  <a href="https://ko-fi.com/K3K61KXALF">
+    <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi" />
+  </a>
+</p>
+
 </div>
+
 
 ---
 ## Overview
+Open a folder, skim RAW files at speed, mark keepers, and export only your selects.<br>
+Zebra + Histogram and Faux HDR help check exposure and detail. Ratings and color labels are saved to XMP for use in other editors.
 
-Simple Raw Picker is a fast, simple culling app for RAW files. Open a folder (no subfolders), skim at speed, mark keepers, and export only your selects. Zebra + Histogram and Faux HDR help check exposure and detail. Ratings and color labels are saved to XMP for use in other editors.
+
+## Download
+[simple-raw-picker-setup](https://github.com/recu3125/simpleRawPicker/releases/download/v1.0/simple-raw-picker-setup.zip)
 
 ## Quick Start
 
